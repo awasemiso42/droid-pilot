@@ -1,0 +1,11 @@
+# ノートを開いてペンで描き、元に戻すとやり直すが押せる
+# 2026-11-08 22:32 に dp journal の 14〜19 から保存（expect enabled は手で足した）
+# 例: ノートアプリのリポジトリの dpflows/ に置くと dp flow run note-draw-undo で再生できる
+app note
+tap 'text~:無題のノート 2'
+wait text:ページを追加
+draw wave --box 250,300,300,150 --stylus
+tap text:元に戻す
+expect enabled:text:やり直す
+expect nocrash
+tap text:フォルダ画面に戻る

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- droid-pilot keyboard: an input method with no keys. dp switches to it only while typing,
+     commits the text it is sent, and switches back to the user's keyboard. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.droidpilot.ime">
+
+    <application android:label="droid-pilot keyboard" android:allowBackup="false">
+        <service
+            android:name=".DpIme"
+            android:label="droid-pilot keyboard"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/method" />
+        </service>
+    </application>
+</manifest>

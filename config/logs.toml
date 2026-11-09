@@ -1,0 +1,18 @@
+# dp log / dp up で見せないログ。端末やライブラリが出す、アプリの不具合ではない行。
+# 「タグ: 本文」に正規表現で当てる。クラッシュと ANR は消さない。
+# 除いた行数は出力に出る。全部見るときは dp log --raw。
+
+ignore = [
+  # Xiaomi（MIUI / HyperOS）
+  "^FileUtils: err (open|write to) mi_exception_log",
+  "^FramePredict: ",
+  "^LB: fail to open node",
+  "FrameInsert open fail",
+  "Can't find memory status under: /sys/block/zram",
+  # Android 本体・グラフィックス
+  "^FeatureFlagsImplExport: .*AconfigStorageReadException",
+  "^OpenGLRenderer: Unable to match the desired swap behavior",
+  "^Gralloc4: buffer descriptor contains invalid usage bits",
+  "^ASurfaceControlTest: ",
+  "^libc: Access denied finding property ",
+]

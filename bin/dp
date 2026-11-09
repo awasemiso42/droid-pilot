@@ -1,0 +1,4 @@
+#!/bin/sh
+# droid-pilot launcher. Link it into PATH: ln -s ~/apps/droid-pilot/bin/dp ~/.local/bin/dp
+ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec python3 -P -m dp "$@"

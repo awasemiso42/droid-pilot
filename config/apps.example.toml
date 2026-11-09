@@ -1,0 +1,29 @@
+# アプリごとの設定。名前は `dp -a <名前>` で使う（省略すると、今いるリポジトリから決まる）。
+#
+# package  パッケージ名
+# repo     リポジトリ（~ 可）。ビルドはここで走る。スクショや記録は <repo>/.dp/ に置く
+# build    ビルドのコマンド（dp が --console=plain を足す）
+# apk      ビルドでできる APK。リポジトリからの相対パスで glob 可。{abi} は端末の ABI に置き換わる
+#          複数書くと、上から順に最初に見つかったものを使う
+# code     スタックトレースで残すパッケージの先頭（ここに無い行は「フレームワーク N 行」にまとめる）
+# outward  「外に出る系」として人の確認を求める語の追加（正規表現）
+
+#
+# このファイルを config/apps.toml にコピーして書き換える（config/apps.toml は Git に入れない）。
+
+[apps.notes]
+package = "com.example.notes"
+repo = "~/src/notes"
+# 動的機能まで全部入った APK を作る例
+build = "./gradlew :app:packageDebugUniversalApk"
+apk = ["app/build/outputs/apk_from_bundle/debug/app-debug-universal.apk"]
+code = ["com.example.notes"]
+outward = ["共有リンク"]
+
+[apps.shop]
+package = "com.example.shop"
+repo = "~/src/shop"
+build = "./gradlew :app:assembleDebug"
+# ABI ごとに分かれた APK の例
+apk = ["app/build/outputs/apk/debug/app-{abi}-debug.apk", "app/build/outputs/apk/debug/app-debug.apk"]
+code = ["com.example.shop"]

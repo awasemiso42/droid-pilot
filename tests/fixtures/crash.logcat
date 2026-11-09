@@ -1,0 +1,16 @@
+1731070000.100  u0_a213  4567  4567 I ActivityThread: Displayed main
+1731070001.200  u0_a213  4567  4590 E CoEdit  : connect failed: ECONNREFUSED 10.0.2.2:8080
+1731070002.200  u0_a213  4567  4590 E CoEdit  : connect failed: ECONNREFUSED 10.0.2.2:8081
+1731070003.200  u0_a213  4567  4590 W NoteSync: retry in 30s
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: FATAL EXCEPTION: main
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: Process: com.example.notes, PID: 4567
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: java.lang.IllegalStateException: page index -1
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	at com.example.notes.ui.PageView.scrollTo(PageView.java:812)
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	at com.example.notes.ui.EditorActivity.onResume(EditorActivity.java:233)
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	at android.app.Instrumentation.callActivityOnResume(Instrumentation.java:1531)
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	at android.app.Activity.performResume(Activity.java:8422)
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: Caused by: java.lang.ArrayIndexOutOfBoundsException: length=0; index=-1
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	at java.util.ArrayList.get(ArrayList.java:439)
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	at com.example.notes.model.Book.page(Book.java:90)
+1731070004.000  u0_a213  4567  4567 E AndroidRuntime: 	... 12 more
+1731070004.500  system   612   640 I ActivityManager: Force finishing activity

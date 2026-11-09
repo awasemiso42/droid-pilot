@@ -1,0 +1,36 @@
+# 安全の規則。語はすべて正規表現（大文字小文字は区別しない）。
+# 押そうとした要素のラベル（文字・説明・子の文字）に当てる。入力欄は対象外（文字を入れるだけでは外に出ないため）。
+
+# 外に出る系: お金が動く・他人に届く・公開される。どの端末でも人の確認（--yes ＋ Claude Code の確認）が要る
+outward = [
+  "購入", "課金", "支払", "サブスク", "定期購入", "\\bbuy\\b", "purchase", "subscribe",
+  "送信", "\\bsend\\b", "招待", "invite", "メールを送", "send email",
+  "^共有$", "共有する", "\\bshare\\b", "公開する", "publish", "投稿", "\\bpost\\b",
+]
+
+# 中で消す系: 端末の中のデータを消す。safe 端末では押せない
+destructive = [
+  "削除", "delete", "消去", "ログアウト", "sign out", "log out", "退会", "初期化", "\\breset\\b",
+]
+
+# 操作してよい前面のパッケージ。対象アプリと apps.toml の全アプリは自動で入る
+allowed_packages = [
+  "com.google.android.apps.nexuslauncher",
+  "com.android.launcher3",
+  "com.sec.android.app.launcher",
+  "com.miui.home",
+  "com.google.android.permissioncontroller",
+  "com.android.permissioncontroller",
+]
+
+# emu / test 端末でだけ操作してよいパッケージ（ファイル選択など。safe 端末では私物のファイルが見えるため止める）
+test_only_packages = [
+  "com.android.documentsui",
+  "com.google.android.documentsui",
+]
+
+# 権限ダイアログ。safe 端末では押さずに人に聞く
+permission_packages = [
+  "com.google.android.permissioncontroller",
+  "com.android.permissioncontroller",
+]

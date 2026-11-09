@@ -1,0 +1,9 @@
+# テスト用として扱う実機。ここに無い実機は safe（読み取りだけ）になる。
+# エミュレータは登録しなくても emu として扱う。
+# このファイルを config/devices.toml にコピーして使う（config/devices.toml は Git に入れない）。
+# 登録は人がする: `dp register <serial> --policy test`（Claude Code の確認が出る）か、このファイルを直接書く。
+#
+# [devices."R5CW30XXXX"]
+# policy = "test"
+# note = "テスト用タブレット"
+
