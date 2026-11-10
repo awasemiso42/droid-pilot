@@ -15,4 +15,6 @@ ignore = [
   "^Gralloc4: buffer descriptor contains invalid usage bits",
   "^ASurfaceControlTest: ",
   "^libc: Access denied finding property ",
+  # 描画が遅い端末（エミュレータなど）で起動直後に出る。窓の描画の同期を待ちきれなかっただけ
+  "^SurfaceSyncGroup: Failed to receive transaction ready in \\d+ms",
 ]
