@@ -83,6 +83,35 @@ dp launch [Activity|deeplink]   dp stop   dp reset (clears app data; emu/test on
 - Device noise (MIUI and graphics-driver lines the app's process prints) is dropped by `config/logs.toml`, and the head says how many lines were dropped. `--raw` shows them. If a new noise line keeps making `dp up` NG and it is clearly not the app's fault, propose adding a pattern there.
 - `dp mark "メモ"` puts a marker into the journal and into logcat.
 
+## Measuring
+
+`dp perf` reads numbers about the app under test. It touches only the app's own package and never asks for confirmation, so use it instead of `dp raw shell dumpsys …` / `am start -W`.
+
+```
+dp perf start [--runs 3]   # cold start: stop, start, TotalTime; prints the median and each run
+dp perf reset              # zero the frame counters
+dp perf frames             # frames since the reset: total, slow frames (%), p50/p90/p95/p99, slow-frame causes
+dp perf idle [--secs 10]   # reset, leave the screen alone, count frames: above 0 means something keeps drawing
+dp perf mem                # TOTAL PSS, heaps, graphics, and Views / Activities counts (for leaks)
+dp perf apk [--depth 2] [--top 8]   # size of the built APK and its largest groups; needs no running app
+```
+
+- A frame measurement is `dp perf reset`, then the actions (scroll, type, drag), then `dp perf frames`.
+- Compare like with like: the same build type and device. A debug build is slower than what users get, and on a 120 Hz screen the frame budget is 8.3 ms.
+- For a leak, open and close a screen several times and compare `dp perf mem` before and after: `Activities` and `ViewRootImpl` should come back to where they were.
+
+## Dark theme, font size, rotation
+
+On `emu` / `test` devices `dp env` changes how the device shows the app, and remembers the original values.
+
+```
+dp env show
+dp env dark on|off        dp env font 1.3        dp env rotate land|port|auto
+dp env reset              # back to what it was before the first change
+```
+
+Always finish with `dp env reset`. Look at the screen again after a change (`dp screen`, `dp shot`): the activity is usually recreated.
+
 ## Regression flows
 
 Every action is numbered in the journal.
@@ -108,9 +137,10 @@ dp flow run note-add-page                     # or: dp flow run --all
 
 ```
 dp devices      dp doctor      dp setup (a person runs it once at the device)
-dp raw shell dumpsys meminfo <pkg>     # escape hatch; asks the user; safe devices: read-only
+dp raw shell getprop ro.build.version.release   # escape hatch; asks the user every time; safe devices: read-only
 ```
 
+- `dp raw` stops and waits for a person each time. Reach for it only when no dp command gives the number; frames, memory, start time, APK size, dark theme, font size and rotation all have one.
 - With two devices connected, pick one with `-s <serial>` (an emulator wins when there is one).
 - The app is picked from the current repository; `-a NAME` (a name from `config/apps.toml`) overrides that.
 - If the tree cannot be read ("画面が動き続けています"), use `dp shot` and look at the picture.

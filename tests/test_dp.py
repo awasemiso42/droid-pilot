@@ -12,7 +12,7 @@ import re  # noqa: E402
 
 from PIL import Image, ImageDraw  # noqa: E402
 
-from dp import actions, build, inject, logs, safety, shot, ui, flow  # noqa: E402
+from dp import actions, build, inject, logs, perf, safety, shot, ui, flow  # noqa: E402
 from dp.out import Blocked  # noqa: E402
 
 FIX = ROOT / "tests" / "fixtures"
@@ -239,6 +239,83 @@ class FlowTest(unittest.TestCase):
                     self.assertTrue(100 <= x <= 300 and 100 <= y <= 200, (name, x, y))
 
 
+class PerfTest(unittest.TestCase):
+    GFX = """Applications Graphics Acceleration Info:
+** Graphics info for pid 1234 [com.example.notes] **
+
+Stats since: 123456789ns
+Total frames rendered: 1204
+Janky frames: 825 (68.52%)
+Janky frames (legacy): 31 (2.57%)
+50th percentile: 10ms
+90th percentile: 15ms
+95th percentile: 18ms
+99th percentile: 24ms
+Number Missed Vsync: 15
+Number High input latency: 168
+Number Slow UI thread: 825
+Number Slow bitmap uploads: 0
+Number Slow issue draw commands: 391
+Number Frame deadline missed: 825
+Number Frame deadline missed (legacy): 12
+"""
+    MEM = """Applications Memory Usage (in Kilobytes):
+ App Summary
+                       Pss(KB)                        Rss(KB)
+                        ------                         ------
+           Java Heap:    19968                          31000
+         Native Heap:    51600                          52000
+                Code:    88064                         120000
+               Stack:     1900                           1900
+            Graphics:    96768                          96768
+       Private Other:     8700
+              System:    16500
+             Unknown:                                    2000
+
+           TOTAL PSS:   283572            TOTAL RSS:   303668       TOTAL SWAP PSS:      120
+
+ Objects
+               Views:       10         ViewRootImpl:        1
+         AppContexts:        5           Activities:        1
+            WebViews:        0
+"""
+
+    def test_start(self):
+        out = "Starting: Intent { cmp=a/.Main }\nStatus: ok\nLaunchState: COLD\nTotalTime: 1491\nWaitTime: 1503\nComplete"
+        r = perf.parse_start(out)
+        self.assertEqual((r["total"], r["wait"], r["state"]), (1491, 1503, "COLD"))
+        s = perf.start_summary([r, {"total": 1672, "wait": 1, "state": "COLD"}, {"total": 1473, "wait": 1, "state": "WARM"}])
+        self.assertEqual((s["median"], s["not_cold"]), (1491, 1))
+        self.assertIsNone(perf.start_summary([perf.parse_start("Error: Activity class does not exist")])["median"])
+
+    def test_frames_ignores_the_legacy_lines(self):
+        f = perf.parse_frames(self.GFX)
+        self.assertEqual((f["total"], f["janky"], f["janky_pct"]), (1204, 825, 68.52))
+        self.assertEqual(f["pct"], {50: 10, 90: 15, 95: 18, 99: 24})
+        self.assertEqual(f["counts"]["Frame deadline missed"], 825)
+        self.assertEqual(f["counts"]["Slow bitmap uploads"], 0)
+        text = "\n".join(perf.frames_lines(f))
+        self.assertIn("68.52%", text)
+        self.assertNotIn("Slow bitmap uploads", text)
+        self.assertFalse(perf.parse_frames("No process found for: com.example")["found"])
+
+    def test_mem(self):
+        m = perf.parse_mem(self.MEM)
+        self.assertEqual(m["total_pss"], 283572)
+        self.assertEqual(m["summary"]["Java Heap"], 19968)
+        self.assertEqual(m["summary"]["Graphics"], 96768)
+        self.assertEqual((m["objects"]["Views"], m["objects"]["ViewRootImpl"], m["objects"]["Activities"]), (10, 1, 1))
+        self.assertIsNone(perf.parse_mem("No process found for: com.example")["total_pss"])
+
+    def test_apk_groups(self):
+        files = [("classes.dex", 900, 400), ("classes2.dex", 100, 50), ("lib/arm64-v8a/a.so", 500, 300),
+                 ("lib/arm64-v8a/b.so", 100, 60), ("assets/dict/x/y.bin", 9000, 2500), ("res/a.xml", 10, 5)]
+        g = perf.apk_groups(files, depth=2, top=3)
+        self.assertEqual(g[0], ("assets/dict/", 9000, 2500))
+        self.assertEqual(g[1], ("*.dex", 1000, 450))
+        self.assertEqual(g[2], ("lib/arm64-v8a/", 600, 360))
+
+
 class HookTest(unittest.TestCase):
     def run_hook(self, command):
         p = subprocess.run([sys.executable, str(ROOT / "claude" / "hooks" / "guard.py")],
@@ -260,6 +337,9 @@ class HookTest(unittest.TestCase):
         self.assertEqual(self.run_hook("dp tap 9 --yes"), "ask")
         self.assertEqual(self.run_hook("dp -s emu raw shell ls"), "ask")
         self.assertEqual(self.run_hook("dp raw shell ls"), "ask")
+        self.assertIsNone(self.run_hook("dp perf start --runs 3"))
+        self.assertIsNone(self.run_hook("dp -a calc perf mem"))
+        self.assertIsNone(self.run_hook("dp env dark on"))
         self.assertEqual(self.run_hook("dp register R5C --policy test"), "ask")
 
 
