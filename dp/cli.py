@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from . import (actions, build as buildmod, config, emu, flow as flowmod, ime, inject, javabuild, logs,
-               safety, shot, ui)
+               perf, safety, shot, ui)
 from .device import Device, select
 from .adb import list_devices
 from .out import Blocked, Fail, Result, ok, ng, OK, NG, BLOCKED
@@ -984,6 +984,142 @@ def c_raw(ctx, a):
     return Result(f"adb {' '.join(args)[:80]}（終了コード {p.returncode}）", lines, OK if p.returncode == 0 else NG)
 
 
+# --- measurements and device look ------------------------------------------------
+
+def _gfx(ctx, app, reset=False):
+    return ctx.dev.adb.sh(f"dumpsys gfxinfo {app.package}" + (" reset" if reset else ""), timeout=30)
+
+
+def c_perf(ctx, a):
+    """Numbers about the app under test. Reads only the app's own package, so no confirmation is needed."""
+    app = ctx.need_app()
+    dev = ctx.dev
+    what = a.what
+    if what == "start":
+        comp = _launch_activity(dev, app)
+        n, dev_t = ctx.step(f"perf start --runs {a.runs}")
+        runs = []
+        for _ in range(max(1, a.runs)):
+            dev.adb.sh(f"am force-stop {app.package}", timeout=15)
+            time.sleep(1.0)
+            out = dev.adb.sh(f"am start -W -n {shlex.quote(comp)}", timeout=60)
+            if "Error" in out or "Exception" in out:
+                res = ng("perf start: 起動できません", [l for l in out.splitlines() if "Error" in l or "Exception" in l][:3])
+                ctx.journal(n, "perf start", res, dev_t)
+                return res
+            runs.append(perf.parse_start(out))
+            time.sleep(1.5)
+        ctx.dstate["launch_t"] = dev_t
+        s = perf.start_summary(runs)
+        if s["median"] is None:
+            res = ng("perf start: TotalTime が読めません")
+        else:
+            lines = [f"{len(s['runs'])} 回: {' '.join(str(t) for t in s['runs'])} ms（止めてからの起動。TotalTime）"]
+            if s["not_cold"]:
+                lines.append(f"{s['not_cold']} 回はコールドスタートではありませんでした")
+            res = ok(f"perf start 中央値 {s['median']}ms", lines, median_ms=s["median"], runs_ms=s["runs"])
+        ctx.journal(n, f"perf start --runs {a.runs}", res, dev_t)
+        return res
+    if what == "reset":
+        _gfx(ctx, app, reset=True)
+        return ok("perf reset（フレームの記録を 0 にしました）")
+    if what == "frames":
+        f = perf.parse_frames(_gfx(ctx, app))
+        return ok("perf frames（前の reset から）", perf.frames_lines(f), **f)
+    if what == "idle":
+        _gfx(ctx, app, reset=True)
+        time.sleep(a.secs)
+        f = perf.parse_frames(_gfx(ctx, app))
+        total = f["total"] or 0
+        note = "何も描いていません" if total == 0 else "触っていないのに描き続けています"
+        return ok(f"perf idle {a.secs:g} 秒で {total} フレーム（{note}）", perf.frames_lines(f) if total else [], **f)
+    if what == "mem":
+        m = perf.parse_mem(dev.adb.sh(f"dumpsys meminfo {app.package}", timeout=30))
+        return ok("perf mem", perf.mem_lines(m), **m)
+    if what == "apk":
+        apk = buildmod.find_apk(app, dev.abi)
+        if not apk or not apk.exists():
+            return ng("APK がありません。dp build でビルドしてください", [f"探した場所: {', '.join(app.apk)}"])
+        r = perf.apk_report(apk, depth=a.depth, top=a.top)
+        lines = [f"{k:<44} {c / 1e6:6.2f}MB（展開 {u / 1e6:.2f}MB）" for k, u, c in r["groups"]]
+        return ok(f"perf apk {rel(apk)} {r['size'] / 1e6:.2f}MB（{r['files']} ファイル）", lines,
+                  size=r["size"], groups=r["groups"])
+    raise Fail(f"perf {what} は分かりません")
+
+
+ENV_KEYS = {"dark": "night", "font": "font_scale", "rotate": "rotation"}
+
+
+def _env_read(dev):
+    night = dev.adb.sh("cmd uimode night", timeout=10)
+    m = re.search(r"Night mode:\s*(\w+)", night)
+    get = lambda key: dev.adb.sh(f"settings get system {key}", timeout=10).strip()
+    font = get("font_scale")
+    return {"night": m.group(1) if m else "?", "font_scale": "1.0" if font in ("null", "") else font,
+            "accelerometer_rotation": get("accelerometer_rotation"), "user_rotation": get("user_rotation")}
+
+
+def _env_text(env):
+    rot = "auto" if env["accelerometer_rotation"] == "1" else {"0": "port", "1": "land", "2": "port（逆）",
+                                                              "3": "land（逆）"}.get(env["user_rotation"], "?")
+    return f"dark {'on' if env['night'] == 'yes' else 'auto' if env['night'] == 'auto' else 'off'}  font {env['font_scale']}  rotate {rot}"
+
+
+def _env_apply(dev, env):
+    dev.adb.sh(f"cmd uimode night {shlex.quote(env['night'])}", timeout=10)
+    for key in ("font_scale", "accelerometer_rotation", "user_rotation"):
+        if env[key] not in ("null", ""):
+            dev.adb.sh(f"settings put system {key} {shlex.quote(env[key])}", timeout=10)
+
+
+def c_env(ctx, a):
+    """Dark theme, font size and rotation of an emu / test device, with a way back (`dp env reset`)."""
+    dev = ctx.dev
+    now = _env_read(dev)
+    if a.what == "show":
+        saved = ctx.dstate.get("env_orig")
+        return ok(f"env {_env_text(now)}", [f"元の設定: {_env_text(saved)}（dp env reset で戻す）"] if saved else [])
+    safety.require(dev, "settings")
+    if a.what == "reset":
+        saved = ctx.dstate.pop("env_orig", None)
+        if not saved:
+            return ok(f"env は変えていません: {_env_text(now)}")
+        _env_apply(dev, saved)
+        time.sleep(1.0)
+        return ok(f"env reset {_env_text(_env_read(dev))}")
+    new = dict(now)
+    v = (a.value or "").lower()
+    if a.what == "dark":
+        if v not in ("on", "off"):
+            raise Fail("dp env dark on | off")
+        new["night"] = "yes" if v == "on" else "no"
+    elif a.what == "font":
+        try:
+            scale = float(v)
+        except ValueError:
+            scale = 0
+        if not 0.8 <= scale <= 2.0:
+            raise Fail("dp env font 0.8〜2.0（1.0 が標準、1.3 で大きい文字）")
+        new["font_scale"] = f"{scale:g}"
+    elif a.what == "rotate":
+        if v not in ("land", "port", "auto"):
+            raise Fail("dp env rotate land | port | auto")
+        new["accelerometer_rotation"] = "1" if v == "auto" else "0"
+        if v != "auto":
+            new["user_rotation"] = "1" if v == "land" else "0"
+    ctx.dstate.setdefault("env_orig", now)
+    _env_apply(dev, new)
+    time.sleep(1.5)
+    after = _env_read(dev)
+    lines = ["終わったら dp env reset で元に戻してください"]
+    try:
+        ctx.capture()
+    except (ui.IdleError, Fail):
+        pass
+    return ok(f"env {_env_text(after)}", lines)
+
+
+
 def c_register(ctx, a):
     if a.policy not in ("test", "safe"):
         raise Fail("--policy は test か safe")
@@ -1112,6 +1248,15 @@ def build_parser():
     cmd("setup", c_setup, "dp の補助（線を引く補助・キーボード）を用意する。人が端末の前で")
     s = cmd("raw", c_raw, "adb をそのまま（safe 端末は読み取りだけ）")
     s.add_argument("args", nargs=argparse.REMAINDER)
+    s = cmd("perf", c_perf, "計測（起動時間・フレーム・メモリ・APK の大きさ）")
+    s.add_argument("what", choices=["start", "frames", "reset", "idle", "mem", "apk"])
+    s.add_argument("--runs", type=int, default=3, help="start: 回数（中央値を出す）")
+    s.add_argument("--secs", type=float, default=10, help="idle: 触らずに待つ秒数")
+    s.add_argument("--depth", type=int, default=2, help="apk: まとめるフォルダの深さ")
+    s.add_argument("--top", type=int, default=8, help="apk: 表示する件数")
+    s = cmd("env", c_env, "端末の見た目（ダーク・文字の大きさ・向き）。safe 以外")
+    s.add_argument("what", choices=["show", "dark", "font", "rotate", "reset"])
+    s.add_argument("value", nargs="?")
     s = cmd("register", c_register, "実機をテスト用として登録（人がする）")
     s.add_argument("serial_to_register")
     s.add_argument("--policy", default="test")
