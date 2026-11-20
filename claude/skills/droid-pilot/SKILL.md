@@ -114,6 +114,7 @@ dp trace report [FILE]      # read a pulled trace again (default: the newest one
 - The summary covers the app's process (all `pkg:*` processes added together, and it says so): slow frames by jank type with the longest ones, how long the main thread ran / waited to run / waited on I/O (`カーネル待ち` is other uninterruptible waiting), the heaviest main-thread work (own time), Binder calls from the main thread, and GCs. Each long item names the step it came after (`step 161: tap …`, taken from dp's journal), so the steps (`dp tap` …) between start and stop are what tell you where to look. Only the span between start and stop is analyzed.
 - The trace file is under `.dp/runs/*-trace/trace.pftrace` and opens at https://ui.perfetto.dev for the full picture.
 - If `--max` ran out before `dp trace stop`, the summary says so: actions after that point are not in the trace. Set `--max` longer than the actions take.
+- Run `dp trace start` / `dp trace stop` one at a time and wait for each to finish (a stop takes a few seconds). A second one while the first is running returns NG `別の dp trace start / stop が実行中です`; read the first one's result instead.
 - Keep the recording short and focused on the slow action. The first run downloads `trace_processor` (pinned, checksum-verified) into the dp cache; `DP_TRACE_PROCESSOR` points at your own copy.
 
 ## Dark theme, font size, rotation

@@ -644,8 +644,43 @@ class TraceCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cli, ctx, fake = self.start(tmp)
             ctx.dstate["trace"]["boot_id"] = "old-boot"
+            ctx.state.save()  # stop reads the trace state again from disk
             cli.c_trace(ctx, self.args("stop"))
             self.assertFalse(fake.killed)
+
+    def test_a_second_start_or_stop_waits_for_none_and_says_why(self):
+        import fcntl
+        from dp.out import Fail
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.start(tmp)
+            with open(ctx.state.dir / "trace.lock", "w") as held:  # another dp trace stop is running
+                fcntl.flock(held, fcntl.LOCK_EX)
+                for what in ("stop", "start"):
+                    with self.assertRaises(Fail) as e:
+                        cli.c_trace(ctx, self.args(what))
+                    self.assertIn("別の dp trace start / stop が実行中", e.exception.msg)
+            self.assertFalse(fake.killed)
+            self.assertIn("trace", ctx.dstate)
+            from unittest import mock
+            with mock.patch.object(cli.trace, "analyze", return_value=("trace 1.0 秒", [], {"seconds": 1.0})):
+                self.assertEqual(cli.c_trace(ctx, self.args("stop")).code, 0)  # free again once released
+
+    def test_stop_after_another_stop_finished_sees_the_cleared_state(self):
+        from unittest import mock
+        from dp.state import State
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.start(tmp)
+            _, other, other_fake = self.make(tmp)  # a second dp process that loaded the state while recording
+            self.assertIn("trace", other.dstate)
+            with mock.patch.object(cli.trace, "analyze", return_value=("trace 1.0 秒", [], {"seconds": 1.0})):
+                self.assertEqual(cli.c_trace(ctx, self.args("stop")).code, 0)
+                res = cli.c_trace(other, self.args("stop"))
+            self.assertEqual(res.code, 1)
+            self.assertIn("記録していません", res.first_line())
+            self.assertFalse(other_fake.killed)
+            self.assertFalse(any("pull" in str(c) for c in other_fake.calls))
+            other.state.save()  # what main() does at the end must not bring the old trace back
+            self.assertNotIn("trace", State(ctx.app).dev("x"))
 
     def test_stop_with_a_lost_file_clears_the_state(self):
         with tempfile.TemporaryDirectory() as tmp:
