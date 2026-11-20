@@ -11,8 +11,8 @@ AI エージェント（Claude Code）が Android のエミュレータやテス
 ## 準備
 
 ```bash
-ln -s ~/apps/droid-pilot/bin/dp ~/.local/bin/dp          # PATH に入れる
-ln -s ~/apps/droid-pilot/claude/skills/droid-pilot ~/.claude/skills/droid-pilot   # Claude Code に使い方を教える
+ln -s ~/Projects/droid-pilot/bin/dp ~/.local/bin/dp          # PATH に入れる
+ln -s ~/Projects/droid-pilot/claude/skills/droid-pilot ~/.claude/skills/droid-pilot   # Claude Code に使い方を教える
 ```
 
 端末はテスト用の実機を USB でつなぐか、エミュレータを使う（`dp emu create/start`。`system-images;android-36;google_apis;x86_64` が要る）。
@@ -45,7 +45,7 @@ dp は端末側に小さな部品を 2 つ使う。どちらもこのリポジ�
   "hooks": {
     "PreToolUse": [{
       "matcher": "Bash",
-      "hooks": [{ "type": "command", "command": "python3 ~/apps/droid-pilot/claude/hooks/guard.py" }]
+      "hooks": [{ "type": "command", "command": "python3 ~/Projects/droid-pilot/claude/hooks/guard.py" }]
     }]
   }
 }

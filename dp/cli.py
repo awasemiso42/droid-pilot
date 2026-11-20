@@ -1,5 +1,7 @@
 """dp: commands. Each returns a Result whose first line is OK / NG / BLOCKED."""
 import argparse
+import contextlib
+import fcntl
 import json
 import re
 import shlex
@@ -1117,7 +1119,8 @@ def _trace_stop(ctx, app):
     dev = ctx.dev
     cur = ctx.dstate.get("trace")
     if not cur:
-        return ng("trace stop: 記録していません", ["dp trace start から始めてください"])
+        return ng("trace stop: 記録していません", ["dp trace start から始めてください",
+                                                 "直前に別の dp trace stop が取り出していれば dp trace report で見られます"])
     n, dev_t = ctx.step("trace stop")
     pid = int(cur["pid"])
     ended_early = not _perfetto_alive(dev, cur)  # --max may have stopped it already
@@ -1159,6 +1162,34 @@ def _trace_stop(ctx, app):
     return res
 
 
+@contextlib.contextmanager
+def _trace_lock(ctx):
+    """One `dp trace start` / `stop` at a time per app.
+
+    Inside the lock the trace state is read again from disk (another stop may have just finished and
+    cleared it) and saved before the lock is released, so the next one sees the result.
+    """
+    f = open(ctx.state.dir / "trace.lock", "w")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Fail("trace: 別の dp trace start / stop が実行中です", ["終わるのを待って、その結果を見てください"])
+        disk = State(ctx.app).data
+        cur = disk.get("devices", {}).get(ctx.dev.serial, {}).get("trace")
+        if cur is None:
+            ctx.dstate.pop("trace", None)
+        else:
+            ctx.dstate["trace"] = cur
+        ctx.state.data["step_seq"] = max(ctx.state.data.get("step_seq", 0), disk.get("step_seq", 0))
+        try:
+            yield
+        finally:
+            ctx.state.save()
+    finally:
+        f.close()  # closing the file releases the lock
+
+
 def _trace_report(ctx, a, app):
     path = Path(a.file).expanduser() if a.file else trace.latest_trace(app)
     if not path.is_file():
@@ -1174,11 +1205,12 @@ def _trace_report(ctx, a, app):
 def c_trace(ctx, a):
     """Perfetto trace of the app: start / stop on the device, then a short summary read on the PC."""
     app = ctx.need_app()
-    if a.what == "start":
-        return _trace_start(ctx, a, app)
-    if a.what == "stop":
+    if a.what == "report":
+        return _trace_report(ctx, a, app)
+    with _trace_lock(ctx):
+        if a.what == "start":
+            return _trace_start(ctx, a, app)
         return _trace_stop(ctx, app)
-    return _trace_report(ctx, a, app)
 
 
 ENV_KEYS = {"dark": "night", "font": "font_scale", "rotate": "rotation"}
