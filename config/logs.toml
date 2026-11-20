@@ -9,12 +9,15 @@ ignore = [
   "^LB: fail to open node",
   "FrameInsert open fail",
   "Can't find memory status under: /sys/block/zram",
+  "^BinderMonitor: err open binder_delay errno=\\d+",
   # Android 本体・グラフィックス
   "^FeatureFlagsImplExport: .*AconfigStorageReadException",
   "^OpenGLRenderer: Unable to match the desired swap behavior",
   "^Gralloc4: buffer descriptor contains invalid usage bits",
   "^ASurfaceControlTest: ",
   "^libc: Access denied finding property ",
+  # キーボードを閉じたときなどに出る。登録済みでない戻るコールバックを外そうとしただけ
+  "^ImeBackDispatcher: Ime callback not found\\. Ignoring unregisterReceivedCallback\\. callbackId: -?\\d+",
   # 描画が遅い端末（エミュレータなど）で起動直後に出る。窓の描画の同期を待ちきれなかっただけ
   "^SurfaceSyncGroup: Failed to receive transaction ready in \\d+ms",
 ]

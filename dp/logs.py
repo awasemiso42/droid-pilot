@@ -163,6 +163,43 @@ def _step_at(markers, t):
     return best.msg if best else ""
 
 
+MAX_STEPS = 4
+
+
+def _steps_for(markers, times):
+    """Lines naming the step that ran just before each time, one per distinct step."""
+    if not markers:
+        return []
+    by_step = OrderedDict()
+    for t in times:
+        step = _step_at(markers, t)
+        if step:
+            by_step.setdefault(step, []).append(t)
+    if not by_step:
+        return []
+    if len(times) == 1:
+        return [f"  直前の操作: {next(iter(by_step))}"]
+    out = []
+    for step, ts in list(by_step.items())[:MAX_STEPS]:
+        clocks = OrderedDict()
+        for t in ts:
+            c = _clock(t)
+            clocks[c] = clocks.get(c, 0) + 1
+        when = "、".join(c + (f" x{k}" if k > 1 else "") for c, k in clocks.items())
+        out.append(f"  直前の操作: {step}（{when}）")
+    if len(by_step) > MAX_STEPS:
+        out.append(f"  … ほか {len(by_step) - MAX_STEPS} 操作")
+    return out
+
+
+def full_text(mine, markers):
+    """The app's lines with the step markers mixed in by time, for `dp log --full`."""
+    rows = [(m.t, 0, f"{_clock(m.t)} ---- {m.msg} ----") for m in markers]
+    rows += [(l.t, 1, f"{_clock(l.t)} {l.level} {l.tag}: {l.msg}") for l in mine]
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return "\n".join(r[2] for r in rows)
+
+
 def report(mine, crashes, anr, markers, code, level="E", grep=None):
     """(head, lines, counts) for `dp log`."""
     lines = []
@@ -207,15 +244,17 @@ def report(mine, crashes, anr, markers, code, level="E", grep=None):
         if grep and not re.search(grep, f"{l.tag} {l.msg}", re.I):
             continue
         key = (l.level, l.tag, _NUM.sub("#", l.msg))
-        g = groups.setdefault(key, {"n": 0, "last": l, "stack": stack})
+        g = groups.setdefault(key, {"n": 0, "last": l, "stack": stack, "times": []})
         g["n"] += 1
         g["last"] = l
+        g["times"].append(l.t)
     for (lv, tag, _), g in groups.items():
         l = g["last"]
         n = f"x{g['n']} " if g["n"] > 1 else ""
         lines.append(f"{lv} {n}{tag}: {l.msg.strip()[:160]}  ({_clock(l.t)})")
         if g["stack"]:
             lines += summarize_stack(g["stack"], code, frames=2)[:3]
+        lines += _steps_for(markers, g["times"])
     if len(lines) > MAX_LINES:
         cut = len(lines) - MAX_LINES
         lines = lines[:MAX_LINES] + [f"(+{cut} 行省略。--full で全部)"]
