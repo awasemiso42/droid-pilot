@@ -1,0 +1,39 @@
+"k","name","n","dur","tot","ts"
+"span","",0,16274632576,0,4364281830009
+"anchor","",0,1795206190848169991,0,4364281830009
+"app","com.android.systemui",3044,0,0,0
+"jank","App Deadline Missed",4,22252971,56500001,0
+"jank","Buffer Stuffing",59,19662639,481682557,0
+"jank","None",316,14144776,1295928950,0
+"ftop","App Deadline Missed",1,90000000,90000000,4373051830009
+"ftop","App Deadline Missed",1,22252971,22252971,4364996868298
+"ftop","App Deadline Missed",1,22044963,22044963,4364996868298
+"ftop","Buffer Stuffing",1,19662639,19662639,4364996868298
+"ftop","Buffer Stuffing",1,16781127,16781127,4366902483779
+"ftop","None",1,14144776,14144776,4365242532278
+"dofr","",247,20040324,3,0
+"dtop","",1,20040324,20040324,4364996867444
+"dtop","",1,19047607,19047607,4365640867892
+"dtop","",1,17304484,17304484,4378524045185
+"dtop","",1,10478313,10478313,4378181256854
+"dtop","",1,10216309,10216309,4374244779232
+"state","D",6,420901,0,0
+"state","R",1478,70426010,70426010,0
+"state","R+",30,5269935,5269935,0
+"state","Running",1508,478667827,478667827,0
+"state","S",1386,14100714358,14100714358,0
+"work","traversal",118,10171996,45169309,4365642387545
+"work","animation",238,3977744,50491508,4364970609509
+"work","StatusBarKeyguardViewManager#hide",1,3416909,3416909,4364982214205
+"work","dispatchApplyInsets",4,3142904,3239217,4365007029797
+"work","VRI[EdgeBackGestureHandler0]-relayoutWindow#first=false/resize=false/vis=true/params=false/force=false",3,3021526,7132446,4378533028380
+"work","CentralSurfaces#hideKeyguard",1,2942465,2942465,4364989509533
+"work","sendMessage(inputChannel=[Gesture Monitor] edge-swipe (client), seq=0x4e66, type=0x2)",1,2353312,2353312,4369926230361
+"work","KeyguardStateController#notifyKeyguardChanged",1,2337035,2337035,4364982659883
+"work","android.app.ActivityThread$H: com.android.systemui.broadcast.ActionReceiver$onReceive$1$1$1",9,2109539,5799928,4368584241672
+"work","postAndWait",115,1905925,34036570,4378198525531
+"work","VRI[NotificationShade]-relayoutWindow#first=false/resize=false/vis=true/params=false/force=false",1,1880412,1880412,4365651994234
+"work","android.os.Handler: kotlinx.coroutines.CancellableContinuationImpl",379,1656291,33528177,4365671514986
+"binder","",52,4960205,45713215,4365652096000
+"aidl","AIDL::java::IActivityManager::getRunningAppProcesses::client",2,6100000,9000000,4366000000000
+"gc","",3,12400000,20100000,4367281830009
