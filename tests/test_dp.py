@@ -181,6 +181,54 @@ class LogsTest(unittest.TestCase):
         self.assertFalse(any(l.tag == "CoEdit" for l in kept))
         self.assertEqual(logs.noise(lines, []), (lines, 0))
 
+    def test_device_noise_is_narrow(self):
+        from dp import config
+        pats = config.log_ignore()
+        L = lambda tag, msg, lv="E": logs.Line(0.0, "", 1, 1, lv, tag, msg)  # noqa: E731
+        lines = [L("BinderMonitor", "err open binder_delay errno=2"),
+                 L("ImeBackDispatcher", "Ime callback not found. Ignoring unregisterReceivedCallback. "
+                                        "callbackId: 232825731"),
+                 L("BinderMonitor", "binder transaction to com.example.notes took 900ms"),
+                 L("ImeBackDispatcher", "something the app caused")]
+        kept, dropped = logs.noise(lines, pats)
+        self.assertEqual(dropped, 2)
+        self.assertEqual([l.msg for l in kept], [lines[2].msg, lines[3].msg])
+
+    def test_errors_name_the_step_before(self):
+        L = lambda t, tag, msg, lv="E": logs.Line(t, "", 1, 1, lv, tag, msg)  # noqa: E731
+        t0 = 1_700_000_000.0
+        markers = [L(t0, "DP", "step 11: launch", "I"),
+                   L(t0 + 10, "DP", "step 12: tap 元に戻す", "I"),
+                   L(t0 + 15, "DP", "step 13: tap やり直す", "I")]
+        mine = [L(t0 + 5, "Once", "boom"),
+                L(t0 + 10.2, "RippleDrawable", "anim error 1"),
+                L(t0 + 10.3, "RippleDrawable", "anim error 2"),
+                L(t0 + 15.1, "RippleDrawable", "anim error 3"),
+                L(t0 + 16.4, "RippleDrawable", "anim error 4")]
+        out, counts = logs.report(mine, [], [], markers, ["com.example.notes"])
+        text = "\n".join(out)
+        self.assertEqual(counts["E"], 5)
+        once = out.index(next(l for l in out if "Once: boom" in l))
+        self.assertEqual(out[once + 1], "  直前の操作: step 11: launch")
+        self.assertIn("E x4 RippleDrawable", text)
+        c = logs._clock
+        self.assertIn(f"  直前の操作: step 12: tap 元に戻す（{c(t0 + 10.2)} x2）", out)
+        self.assertIn(f"  直前の操作: step 13: tap やり直す（{c(t0 + 15.1)}、{c(t0 + 16.4)}）", out)
+        # No markers (or none before the line): nothing is added.
+        self.assertNotIn("直前の操作", "\n".join(logs.report(mine, [], [], [], [])[0]))
+        early = [L(t0 - 1, "Early", "x")]
+        self.assertNotIn("直前の操作", "\n".join(logs.report(early, [], [], markers, [])[0]))
+
+    def test_full_text_mixes_in_markers(self):
+        L = lambda t, tag, msg, lv="E": logs.Line(t, "", 1, 1, lv, tag, msg)  # noqa: E731
+        t0 = 1_700_000_000.0
+        text = logs.full_text([L(t0 + 1, "RippleDrawable", "anim error"), L(t0, "Same", "same time")],
+                              [L(t0, "DP", "step 12: tap 元に戻す", "I")])
+        c = logs._clock
+        self.assertEqual(text.splitlines(), [f"{c(t0)} ---- step 12: tap 元に戻す ----",
+                                             f"{c(t0)} E Same: same time",
+                                             f"{c(t0 + 1)} E RippleDrawable: anim error"])
+
 
 class InjectTest(unittest.TestCase):
     def test_stroke_keeps_corners_and_pace(self):

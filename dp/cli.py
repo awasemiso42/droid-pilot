@@ -809,7 +809,7 @@ def c_log(ctx, a):
     lines, counts = logs.report(mine, crashes, anr, markers, app.code, level=a.level, grep=a.grep)
     if a.full:
         path = ctx.state.run_dir("log") / "log.txt"
-        path.write_text("\n".join(f"{logs._clock(l.t)} {l.level} {l.tag}: {l.msg}" for l in mine))
+        path.write_text(logs.full_text(mine, markers))
         lines.append(f"全文: {rel(path)}")
     parts = []
     if counts["W"] and a.level == "E":

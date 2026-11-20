@@ -78,8 +78,8 @@ dp launch [Activity|deeplink]   dp stop   dp reset (clears app data; emu/test on
 
 ## Logs
 
-- `dp log` covers the time since the last launch. It shows the crash (exception, the app's own frames, `Caused by`), ANRs and grouped errors (`E x3 Tag: message`), plus the step that ran just before a crash.
-- `--since step12 | 60s | 5m | all` changes the time span. `--level W` adds warnings. `--grep RE` filters. `--full` writes everything to a file.
+- `dp log` covers the time since the last launch. It shows the crash (exception, the app's own frames, `Caused by`), ANRs and grouped errors (`E x3 Tag: message`). Under each crash and error it names the step that ran just before it (`直前の操作: step 12: tap …`); when the same error followed several steps, each step is listed with the times.
+- `--since step12 | 60s | 5m | all` changes the time span. `--level W` adds warnings. `--grep RE` filters. `--full` writes everything to a file, with the step markers (`---- step 12: … ----`) mixed in by time.
 - Device noise (MIUI and graphics-driver lines the app's process prints) is dropped by `config/logs.toml`, and the head says how many lines were dropped. `--raw` shows them. If a new noise line keeps making `dp up` NG and it is clearly not the app's fault, propose adding a pattern there.
 - `dp mark "メモ"` puts a marker into the journal and into logcat.
 
