@@ -100,6 +100,22 @@ dp perf apk [--depth 2] [--top 8]   # size of the built APK and its largest grou
 - Compare like with like: the same build type and device. A debug build is slower than what users get, and on a 120 Hz screen the frame budget is 8.3 ms.
 - For a leak, open and close a screen several times and compare `dp perf mem` before and after: `Activities` and `ViewRootImpl` should come back to where they were.
 
+### Why it is slow: `dp trace`
+
+When `dp perf frames` shows slow frames but not why, record a Perfetto trace. It only reads, so it works on every device kind (API 29+; frame jank types need API 31+).
+
+```
+dp trace start [--max 60]   # starts recording on the device; --max stops it by itself after that many seconds
+(… the actions that feel slow: tap, scroll, type …)
+dp trace stop               # stops, pulls the file, and prints the summary
+dp trace report [FILE]      # read a pulled trace again (default: the newest one); needs no device
+```
+
+- The summary covers the app's process (all `pkg:*` processes added together, and it says so): slow frames by jank type with the longest ones, how long the main thread ran / waited to run / waited on I/O (`カーネル待ち` is other uninterruptible waiting), the heaviest main-thread work (own time), Binder calls from the main thread, and GCs. Each long item names the step it came after (`step 161: tap …`, taken from dp's journal), so the steps (`dp tap` …) between start and stop are what tell you where to look. Only the span between start and stop is analyzed.
+- The trace file is under `.dp/runs/*-trace/trace.pftrace` and opens at https://ui.perfetto.dev for the full picture.
+- If `--max` ran out before `dp trace stop`, the summary says so: actions after that point are not in the trace. Set `--max` longer than the actions take.
+- Keep the recording short and focused on the slow action. The first run downloads `trace_processor` (pinned, checksum-verified) into the dp cache; `DP_TRACE_PROCESSOR` points at your own copy.
+
 ## Dark theme, font size, rotation
 
 On `emu` / `test` devices `dp env` changes how the device shows the app, and remembers the original values.

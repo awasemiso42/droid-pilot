@@ -70,6 +70,7 @@ dp draw wave --box 250,300,300,150 --stylus   ペンで線（筆圧付き）
 dp zoom in            2 本指で拡大
 dp log                自アプリのクラッシュとエラー
 dp perf start|frames|idle|mem|apk   起動時間・フレーム・メモリ・APK の大きさ（確認なしで計測できる）
+dp trace start|stop|report   Perfetto のトレースで遅い原因を調べる（start → 操作 → stop。PC 側の trace_processor は初回に自動取得、DP_TRACE_PROCESSOR で指定も可）
 dp env dark on / font 1.3 / rotate land / reset   端末の見た目を変えて、元に戻す
 dp journal            最近の操作（番号付き）
 dp flow save 名前 31-38 / dp flow run 名前    手順の保存と再生

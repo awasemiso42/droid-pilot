@@ -1,8 +1,11 @@
 """Offline tests: run with `python3 -m unittest discover -s tests` from the repository."""
+import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -12,8 +15,8 @@ import re  # noqa: E402
 
 from PIL import Image, ImageDraw  # noqa: E402
 
-from dp import actions, build, inject, logs, perf, safety, shot, ui, flow  # noqa: E402
-from dp.out import Blocked  # noqa: E402
+from dp import actions, build, inject, logs, perf, safety, shot, trace, ui, flow  # noqa: E402
+from dp.out import Blocked, Fail  # noqa: E402
 
 FIX = ROOT / "tests" / "fixtures"
 
@@ -362,6 +365,312 @@ Number Frame deadline missed (legacy): 12
         self.assertEqual(g[0], ("assets/dict/", 9000, 2500))
         self.assertEqual(g[1], ("*.dex", 1000, 450))
         self.assertEqual(g[2], ("lib/arm64-v8a/", 600, 360))
+
+
+class TraceTest(unittest.TestCase):
+    # The journal steps of a real run (device epoch seconds); the fixture's trace starts at realtime 1795210555.13.
+    STEPS = [{"n": 160, "cmd": "trace start --max 60", "dev_t": 1795210555.0647554},
+             {"n": 161, "cmd": "tap text:ページ一覧を開く", "dev_t": 1795210560.9172237},
+             {"n": 162, "cmd": "scroll down", "dev_t": 1795210568.5490625},
+             {"n": 163, "cmd": "tap 'text:ページ 2'", "dev_t": 1795210576.9170756},
+             {"n": 166, "cmd": "trace stop", "dev_t": 1795210594.434743}]
+
+    def rows(self):
+        rows = trace.parse_rows((FIX / "trace-rows.csv").read_text())
+        return rows, trace.step_markers(rows, self.STEPS)
+
+    def test_config_has_package_duration_and_known_fields(self):
+        cfg = trace.perfetto_config("com.example.notes", 45)
+        self.assertIn('atrace_apps: "com.example.notes"', cfg)
+        self.assertIn("duration_ms: 45000", cfg)
+        self.assertEqual(cfg.count("fill_policy: RING_BUFFER"), 2)
+        self.assertNotIn("android.log", cfg)
+        self.assertIn('ftrace_events: "sched/sched_blocked_reason"', cfg)
+        self.assertIn('atrace_categories: "binder_driver"', cfg)
+        self.assertIn('ftrace_events: "sched/sched_switch"', cfg)
+        with self.assertRaises(Fail):
+            trace.perfetto_config("bad'pkg", 5)
+
+    def test_query_quotes_the_package(self):
+        sql = trace.query_sql("com.example.notes")
+        self.assertIn("name = 'com.example.notes'", sql)
+        self.assertIn("substr(name, 1, 18) = 'com.example.notes:'", sql)
+
+    def test_parse_rows_reads_quoted_csv_and_blank_lines(self):
+        text = '"k","name","n","dur","tot","ts"\n"work","a, ""b""",2,5,7,9\n\n"k","name","n","dur","tot","ts"\n"gc","",1,2,3,4\n'
+        rows = trace.parse_rows(text)
+        self.assertEqual([r["k"] for r in rows], ["work", "gc"])
+        self.assertEqual(rows[0]["name"], 'a, "b"')
+        self.assertEqual(rows[0]["tot"], 7)
+
+    def test_query_strips_quotes_from_names(self):
+        # trace_processor_shell prints quotes inside a CSV field unescaped, which would break parsing.
+        self.assertIn("replace(replace(name, '\"', ''''), char(10), ' ')", trace.query_sql("com.example.notes"))
+
+    def test_remote_path_is_unique_per_app_and_run(self):
+        a = trace.remote_path("com.example.a", 1795210555.9)
+        self.assertEqual(a, "/data/misc/perfetto-traces/dp-com.example.a-1795210555.pftrace")
+        self.assertNotEqual(a, trace.remote_path("com.example.b", 1795210555.9))
+        self.assertNotEqual(a, trace.remote_path("com.example.a", 1795210600))
+
+    def test_steps_are_placed_by_device_realtime(self):
+        rows, markers = self.rows()
+        self.assertEqual([(round(m.t, 1), m.msg) for m in markers][:3],
+                         [(-0.1, "step 160: trace start --max 60"), (5.8, "step 161: tap text:ページ一覧を開く"),
+                          (13.4, "step 162: scroll down")])
+
+    def test_no_realtime_anchor_means_no_steps(self):
+        rows, _ = self.rows()
+        rows = [dict(r, dur=0) if r["k"] == "anchor" else r for r in rows]
+        self.assertEqual(trace.step_markers(rows, self.STEPS), [])
+
+    def test_summarize_frames_states_and_work(self):
+        rows, markers = self.rows()
+        head, lines, fields = trace.summarize(rows, markers)
+        # Steps 163 and 166 come after this 16.3 s span ended, so they are not in the range.
+        self.assertEqual(head, "trace 16.3 秒（step 160–162）")
+        self.assertEqual(fields["frames"]["total"], 379)
+        self.assertEqual(fields["frames"]["janky"], 4)
+        self.assertEqual(fields["frames"]["types"], {"App Deadline Missed": 4})
+        self.assertEqual(fields["main_thread_s"]["Runnable"], 0.08)
+        self.assertEqual(fields["work"][0]["name"], "traversal")
+        self.assertEqual(len(fields["work"]), trace.MAX_WORK)
+        self.assertEqual(fields["binder"]["count"], 52)
+        self.assertEqual(fields["gc"], {"count": 3, "total_ms": 20.1, "max_ms": 12.4})
+        text = "\n".join(lines)
+        self.assertIn("フレーム 379  遅い 4（1.1%）  App Deadline Missed 4", text)
+        self.assertIn("Running 0.5秒（3%）", text)
+        self.assertIn("AIDL IActivityManager::getRunningAppProcesses", text)
+        self.assertLessEqual(len(lines), 20)
+
+    def test_longest_frame_at_realtime_1795210563_9_is_step_161(self):
+        rows, markers = self.rows()
+        _, lines, _ = trace.summarize(rows, markers)
+        frame = next(l for l in lines if l.startswith("    +8.8s 90ms"))
+        self.assertTrue(frame.endswith("（step 161: tap text:ページ一覧を開く）"))
+        self.assertTrue(next(l for l in lines if l.startswith("GC ")).endswith("（step 160: trace start --max 60）"))
+
+    def test_stuffing_alone_is_not_jank_and_types_are_split(self):
+        rows = [{"k": "jank", "name": n, "n": c, "dur": 0, "tot": 0, "ts": 0} for n, c in (
+            ("None", 10), ("Buffer Stuffing", 5), ("SurfaceFlinger Stuffing", 4),
+            ("App Deadline Missed, Buffer Stuffing", 2), ("App Deadline Missed", 1))]
+        f = trace.frame_fields(rows)
+        self.assertEqual((f["total"], f["janky"], f["types"]), (22, 3, {"App Deadline Missed": 3}))
+
+    def test_io_wait_and_kernel_wait_are_separate(self):
+        rows, markers = self.rows()
+        self.assertEqual(trace.state_seconds(rows)["I/O"], 0)
+        self.assertGreater(trace.state_seconds(rows)["カーネル待ち"], 0)
+        rows.append({"k": "state", "name": "IO", "n": 1, "dur": 2_000_000_000, "tot": 0, "ts": 0})
+        self.assertEqual(trace.state_seconds(rows)["I/O"], 2.0)
+
+    def test_several_processes_are_said_out_loud(self):
+        rows, markers = self.rows()
+        rows.append({"k": "app", "name": "com.android.systemui:sub", "n": 4000, "dur": 0, "tot": 0, "ts": 0})
+        head, lines, fields = trace.summarize(rows, markers)
+        self.assertEqual(fields["processes"], 2)
+        self.assertIn("2 個のプロセス", lines[0])
+
+    def test_no_frames_text_does_not_claim_the_screen_was_still(self):
+        rows, markers = self.rows()
+        rows = [r for r in rows if r["k"] not in ("jank", "ftop", "dofr", "dtop")]
+        _, lines, _ = trace.summarize(rows, markers)
+        self.assertIn("記録した 16.3 秒の間に、アプリのフレームはありませんでした", lines)
+
+    def test_steps_before_the_first_one_get_no_label(self):
+        rows, markers = self.rows()
+        _, lines, _ = trace.summarize(rows, [m for m in markers if m.t > 1.9])
+        self.assertNotIn("（step", next(l for l in lines if l.startswith("  traversal")))
+
+    def test_choreographer_fallback_without_frametimeline(self):
+        rows, markers = self.rows()
+        rows = [r for r in rows if r["k"] not in ("jank", "ftop")]
+        _, lines, fields = trace.summarize(rows, markers)
+        self.assertEqual(fields["frames"]["source"], "choreographer")
+        self.assertEqual(fields["frames"]["total"], 247)
+        self.assertEqual(fields["frames"]["janky"], 3)
+        self.assertIn("Choreographer#doFrame", lines[0])
+
+    def test_no_app_process_is_a_failure(self):
+        rows, markers = self.rows()
+        with self.assertRaises(Fail):
+            trace.summarize([r for r in rows if r["k"] != "app"], markers)
+
+    def test_work_names_lose_instance_ids(self):
+        rows = [{"k": "work", "name": f"ViewPostImeInputStage id=0x{i}f", "n": 1, "dur": i * 1000000, "tot": i * 1000000,
+                 "ts": i} for i in (1, 2)]
+        merged = trace.merge_work(rows)
+        self.assertEqual([(r["name"], r["n"], r["dur"], r["ts"]) for r in merged], [("ViewPostImeInputStage", 2, 2000000, 2)])
+
+    def test_aidl_name(self):
+        self.assertEqual(trace.aidl_name("AIDL::cpp::IFoo::bar::cppClient"), "IFoo::bar")
+        self.assertEqual(trace.aidl_name("AIDL::java::IFoo::bar::server"), "IFoo::bar")
+
+    def _zip(self, inner="linux-amd64/trace_processor_shell", data=b"#!/bin/sh\n"):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr(inner, data)
+        return buf.getvalue()
+
+    def test_digest_check_rejects_a_wrong_file(self):
+        with self.assertRaises(Fail) as cm:
+            trace.check_digest(self._zip(), "linux-amd64")
+        self.assertIn("ハッシュ", cm.exception.msg)
+        self.assertEqual(set(trace.DIGESTS), {"linux-amd64", "linux-arm64", "mac-amd64", "mac-arm64"})
+
+    def test_digest_check_accepts_the_matching_file(self):
+        data = self._zip()
+        import hashlib
+        orig = dict(trace.DIGESTS)
+        try:
+            trace.DIGESTS["linux-amd64"] = hashlib.sha256(data).hexdigest()
+            trace.check_digest(data, "linux-amd64")
+        finally:
+            trace.DIGESTS.update(orig)
+
+    def test_concurrent_extract_leaves_no_part_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "trace_processor_shell"
+            trace.extract_shell(self._zip(), dest)
+            trace.extract_shell(self._zip(), dest)
+            self.assertEqual([p.name for p in Path(d).iterdir()], ["trace_processor_shell"])
+
+    def test_broken_zip_is_a_failure_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(Fail):
+                trace.extract_shell(b"not a zip", Path(d) / "x")
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_bad_download_is_never_written_or_run(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "tp" / "trace_processor_shell"
+            fake = mock.MagicMock()
+            fake.__enter__.return_value.read.return_value = self._zip()
+            with mock.patch("urllib.request.urlopen", return_value=fake):
+                with self.assertRaises(Fail):
+                    trace.download_shell("linux-amd64", dest)
+            self.assertFalse(dest.exists())
+
+    def test_extract_takes_only_the_shell_and_makes_it_executable(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "x" / "trace_processor_shell"
+            trace.extract_shell(self._zip(), dest)
+            self.assertTrue(os.access(dest, os.X_OK))
+            self.assertEqual([p.name for p in dest.parent.iterdir()], ["trace_processor_shell"])
+            with self.assertRaises(Fail):
+                trace.extract_shell(self._zip("linux-amd64/perfetto"), Path(d) / "y" / "trace_processor_shell")
+
+
+class TraceCliTest(unittest.TestCase):
+    """The device side of dp trace, against a fake adb."""
+    TRACE = None  # set by the tests that need a real file to pull
+
+    def make(self, tmp, cmdline="perfetto --background", boot="b1", remote_exists=True, alive_at_stop=True):
+        import types
+        from unittest import mock
+        from dp import cli, config
+        from dp.state import State
+        fake = types.SimpleNamespace(calls=[], alive=alive_at_stop, killed=False)
+        app = config.App(name="notes", package="com.example.notes", repo=Path(tmp))
+
+        class Adb:
+            def run(s, *a, input=None, **k):
+                fake.calls.append(a)
+                if a[0] == "shell":
+                    fake.input = input
+                    return subprocess.CompletedProcess(a, 0, "4242\n", "")
+                Path(a[2]).write_bytes(b"x")
+                return subprocess.CompletedProcess(a, 0, "", "")
+
+            def sh(s, cmd, timeout=0, check=False):
+                fake.calls.append(cmd)
+                if cmd.startswith("log -t"):
+                    return "1700000100.5\n"
+                if cmd.startswith("kill"):
+                    fake.killed, fake.alive = True, False
+                    return ""
+                if "boot_id" in cmd and "cmdline" in cmd:
+                    return boot + "\n" + (cmdline if fake.alive else "")
+                if "boot_id" in cmd:
+                    return "b1\n"
+                if cmd.startswith("[ -f"):
+                    return "yes" if remote_exists else "no"
+                return ""
+
+        dev = types.SimpleNamespace(serial="x", api=34, adb=Adb(), epoch=lambda: 1.0)
+        ctx = cli.Ctx.__new__(cli.Ctx)
+        ctx.args, ctx.app, ctx.state, ctx._dev, ctx.in_flow, ctx.flow_yes = types.SimpleNamespace(), app, State(app), dev, False, False
+        return cli, ctx, fake
+
+    def args(self, what, **kw):
+        import types
+        return types.SimpleNamespace(what=what, max=30, file=None, **kw)
+
+    def start(self, tmp, **kw):
+        cli, ctx, fake = self.make(tmp, **kw)
+        res = cli.c_trace(ctx, self.args("start"))
+        self.assertEqual(res.code, 0, res.render())
+        return cli, ctx, fake
+
+    def test_start_stores_boot_id_and_a_remote_file_of_its_own(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, ctx, fake = self.start(tmp)
+            cur = ctx.dstate["trace"]
+            self.assertEqual((cur["pid"], cur["boot_id"], cur["n"]), (4242, "b1", 1))
+            self.assertRegex(cur["remote"], r"/dp-com\.example\.notes-1700000100\.pftrace$")
+            self.assertIn("duration_ms: 30000", fake.input)
+
+    def test_stop_kills_only_our_perfetto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from unittest import mock
+            cli, ctx, fake = self.start(tmp, cmdline="/system/bin/surfaceflinger")
+            with mock.patch.object(cli.trace, "analyze", return_value=("trace 30.0 秒", [], {"seconds": 30.0})):
+                res = cli.c_trace(ctx, self.args("stop"))
+            self.assertFalse(fake.killed)  # pid reused by another process: counts as finished
+            self.assertEqual(res.lines[0], "--max 30 秒で自動で止まっていました。そのあとの操作は入っていません")
+
+    def test_a_short_trace_that_ended_early_is_not_called_max(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from unittest import mock
+            cli, ctx, fake = self.start(tmp, cmdline="")
+            with mock.patch.object(cli.trace, "analyze", return_value=("trace 4.4 秒", [], {"seconds": 4.4})):
+                res = cli.c_trace(ctx, self.args("stop"))
+            self.assertNotIn("--max", res.lines[0])
+            self.assertIn("dp trace stop の前に記録が終わっていました", res.lines[0])
+
+    def test_stop_ignores_a_pid_from_another_boot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.start(tmp)
+            ctx.dstate["trace"]["boot_id"] = "old-boot"
+            cli.c_trace(ctx, self.args("stop"))
+            self.assertFalse(fake.killed)
+
+    def test_stop_with_a_lost_file_clears_the_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.start(tmp, remote_exists=False)
+            res = cli.c_trace(ctx, self.args("stop"))
+            self.assertEqual(res.code, 1)
+            self.assertIn("やり直して", "\n".join(res.lines))
+            self.assertNotIn("trace", ctx.dstate)
+
+    def test_stop_saves_the_journal_steps_beside_the_trace(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.start(tmp)
+            ctx.state.next_step()
+            ctx.state.journal({"n": 2, "cmd": "tap text:OK", "dev": "x", "dev_t": 1700000105.0})
+            ctx.state.journal({"n": 9, "cmd": "tap other-device", "dev": "y", "dev_t": 1700000106.0})
+            with mock.patch.object(cli.trace, "analyze", return_value=("trace 1.0 秒", [], {})) as an:
+                res = cli.c_trace(ctx, self.args("stop"))
+            self.assertEqual(res.code, 0, res.render())
+            steps = an.call_args[0][2]
+            self.assertEqual([(s["n"], s["cmd"]) for s in steps], [(1, "trace start --max 30"), (2, "tap text:OK"), (3, "trace stop")])
+            side = json.loads(next(Path(tmp).glob(".dp/runs/*-trace/trace.json")).read_text())
+            self.assertEqual(side["steps"], steps)
+            self.assertNotIn("trace", ctx.dstate)
+            self.assertTrue(fake.killed)
 
 
 class HookTest(unittest.TestCase):
