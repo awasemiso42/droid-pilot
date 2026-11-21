@@ -647,7 +647,7 @@ class TraceCliTest(unittest.TestCase):
     AM_OK = "Status: ok\nLaunchState: COLD\nTotalTime: 1180\nWaitTime: 1190\n"
 
     def make(self, tmp, cmdline="perfetto --background", boot="b1", remote_exists=True, alive_at_stop=True,
-             am_out=AM_OK):
+             am_out=AM_OK, am_err="", am_rc=0):
         import types
         from unittest import mock
         from dp import cli, config
@@ -658,6 +658,10 @@ class TraceCliTest(unittest.TestCase):
         class Adb:
             def run(s, *a, input=None, **k):
                 fake.calls.append(a)
+                if a[0] == "shell" and a[1].startswith("am start"):
+                    if am_rc == "timeout":
+                        raise Fail("adb が 60 秒で終わりませんでした: adb shell am start")
+                    return subprocess.CompletedProcess(a, am_rc, am_out, am_err)
                 if a[0] == "shell":
                     fake.input = input
                     return subprocess.CompletedProcess(a, 0, "4242\n", "")
@@ -812,7 +816,7 @@ class TraceCliTest(unittest.TestCase):
                     text = c if isinstance(c, str) else c[1]
                     kinds += [k for k in keys if k in text][:1]
             self.assertEqual(kinds, ["force-stop", "perfetto --background", "am start", "kill -TERM", "pull", "rm -f"])
-            self.assertIn("duration_ms: 35000", fake.input)  # ceil(5) + 30
+            self.assertIn("duration_ms: 82000", fake.input)  # ceil(1.5 + 60 + 5) + 15: a 60 s start still fits
             self.assertTrue(any(c == cli.PERFETTO_WARMUP for (c,), _ in sl.call_args_list))
             self.assertEqual(res.head, "trace launch cold 1205ms（最初の表示 1576ms・am start 1180ms）")
             self.assertEqual(res.lines[0], "trace 6.5 秒（step 1）")
@@ -846,6 +850,24 @@ class TraceCliTest(unittest.TestCase):
             self.assertTrue(any(isinstance(c, str) and c.startswith("rm -f /data/misc/perfetto-traces/") for c in fake.calls))
             self.assertNotIn("trace", ctx.dstate)
             self.assertFalse(any(isinstance(c, tuple) and c[0] == "pull" for c in fake.calls))
+
+    def test_launch_failure_only_on_stderr_or_exit_code_is_ng(self):
+        from unittest import mock
+        cases = [dict(am_out="", am_err="Error type 3\nError: Activity class {x} does not exist.\n", am_rc=1),
+                 dict(am_out="", am_err="Security exception: Permission Denial\n", am_rc=255),
+                 dict(am_out="", am_err="", am_rc=1),
+                 dict(am_rc="timeout")]
+        for kw in cases:
+            with self.subTest(**{k: str(v) for k, v in kw.items()}), tempfile.TemporaryDirectory() as tmp:
+                cli, ctx, fake = self.make(tmp, **kw)
+                with mock.patch.object(cli.time, "sleep"):
+                    res = cli.c_trace(ctx, self.args("launch"))
+                self.assertEqual(res.code, 1, res.render())
+                self.assertEqual(res.head, "trace launch: 起動できません")
+                self.assertTrue(res.lines)
+                self.assertTrue(fake.killed)
+                self.assertNotIn("trace", ctx.dstate)
+                self.assertFalse(any(isinstance(c, tuple) and c[0] == "pull" for c in fake.calls))
 
     def test_launch_is_refused_while_a_trace_is_recorded(self):
         with tempfile.TemporaryDirectory() as tmp:

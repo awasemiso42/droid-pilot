@@ -1055,7 +1055,8 @@ def c_perf(ctx, a):
 
 TRACE_WAIT = 15
 PERFETTO_WARMUP = 1.5  # seconds between starting perfetto and the app launch, so the data sources are on
-TRACE_LAUNCH_SLACK = 30  # trace launch stops perfetto itself; this is only the safety stop if dp dies
+LAUNCH_TIMEOUT = 60  # seconds `am start -W` may take in trace launch
+TRACE_LAUNCH_SLACK = 15  # trace launch stops perfetto itself; the safety stop (if dp dies) covers the whole run plus this
 BOOT_ID = "/proc/sys/kernel/random/boot_id"
 
 
@@ -1221,7 +1222,7 @@ def _trace_launch(ctx, a, app):
     if refused:
         return refused
     wait = max(0.0, a.wait)
-    secs = math.ceil(wait) + TRACE_LAUNCH_SLACK
+    secs = math.ceil(PERFETTO_WARMUP + LAUNCH_TIMEOUT + wait) + TRACE_LAUNCH_SLACK  # a slow start is never cut off
     comp = _launch_activity(dev, app)
     cmd = f"trace launch --wait {wait:g}"
     n, dev_t = ctx.step(cmd)
@@ -1234,13 +1235,21 @@ def _trace_launch(ctx, a, app):
         return res
     cur = ctx.dstate["trace"]
     time.sleep(PERFETTO_WARMUP)  # perfetto --background returns before the data sources are running
-    out = dev.adb.sh(f"am start -W -n {shlex.quote(comp)}", timeout=60)
     ctx.dstate["launch_t"] = dev_t
-    if "Error" in out or "Exception" in out:
+    try:
+        # run(), not sh(): am start reports some failures only on stderr and with a nonzero exit code
+        p = dev.adb.run("shell", f"am start -W -n {shlex.quote(comp)}", timeout=LAUNCH_TIMEOUT)
+        out, bad = p.stdout, [l.strip() for l in (p.stdout + p.stderr).splitlines()
+                              if "Error" in l or "Exception" in l][:3]
+        if p.returncode != 0 and not bad:
+            bad = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip()][:3] or [f"am start が {p.returncode} で終わりました"]
+    except Fail as e:  # adb timed out
+        out, bad = "", [e.msg, *e.lines]
+    if bad:
         dev.adb.sh(f"kill -TERM {int(cur['pid'])} 2>/dev/null", timeout=10)
         dev.adb.sh(f"rm -f {cur['remote']}", timeout=15)
         ctx.dstate.pop("trace", None)
-        res = ng("trace launch: 起動できません", [l for l in out.splitlines() if "Error" in l or "Exception" in l][:3])
+        res = ng("trace launch: 起動できません", bad)
         ctx.journal(n, cmd, res, dev_t)
         return res
     launch = {"am_start": perf.parse_start(out), "wait": wait}
