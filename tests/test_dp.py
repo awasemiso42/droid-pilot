@@ -379,6 +379,13 @@ class TraceTest(unittest.TestCase):
         rows = trace.parse_rows((FIX / "trace-rows.csv").read_text())
         return rows, trace.step_markers(rows, self.STEPS)
 
+    def test_frames_are_counted_once_per_app_frame_not_per_layer(self):
+        # A SurfaceView frame has a row per layer (the view, its background, BLAST) with one surface frame
+        # token; on a real trace that listed the same 126 ms frame three times and counted 145 frames, not 134.
+        q = re.sub(r"\s+", " ", trace.QUERY)
+        self.assertIn("GROUP BY f.upid, coalesce(f.surface_frame_token, -f.id)", q)
+        self.assertIn("SELECT min(f.ts) AS ts, max(f.dur) AS dur, f.jank_type FROM actual_frame_timeline_slice", q)
+
     def test_config_has_package_duration_and_known_fields(self):
         cfg = trace.perfetto_config("com.example.notes", 45)
         self.assertIn('atrace_apps: "com.example.notes"', cfg)

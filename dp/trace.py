@@ -185,8 +185,12 @@ ms AS (
 kids AS (SELECT parent_id, sum(dur) AS cd FROM slice WHERE parent_id IN (SELECT id FROM ms) GROUP BY parent_id),
 self AS (SELECT ms.name, ms.ts, ms.dur - coalesce(kids.cd, 0) AS self FROM ms LEFT JOIN kids ON kids.parent_id = ms.id),
 frames AS (
-  SELECT f.ts, f.dur, f.jank_type FROM actual_frame_timeline_slice f, win
-  WHERE f.upid IN (SELECT upid FROM app) AND f.ts >= win.s AND f.ts < win.e),
+  -- FrameTimeline has one row per layer (a SurfaceView, its background, BLAST ...) for the same app frame:
+  -- one frame per surface frame token, with the longest layer's duration and jank type (SQLite takes the
+  -- bare columns from the max() row).
+  SELECT min(f.ts) AS ts, max(f.dur) AS dur, f.jank_type FROM actual_frame_timeline_slice f, win
+  WHERE f.upid IN (SELECT upid FROM app) AND f.ts >= win.s AND f.ts < win.e
+  GROUP BY f.upid, coalesce(f.surface_frame_token, -f.id)),
 dofr AS (SELECT ts, dur FROM ms WHERE name GLOB 'Choreographer#doFrame*'),
 gcs AS (
   SELECT s.ts, s.dur FROM slice s JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON t.utid = tt.utid, win
