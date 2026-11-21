@@ -509,6 +509,18 @@ class TraceTest(unittest.TestCase):
         merged = trace.merge_work(rows)
         self.assertEqual([(r["name"], r["n"], r["dur"], r["ts"]) for r in merged], [("ViewPostImeInputStage", 2, 2000000, 2)])
 
+    def test_work_names_lose_long_paths(self):
+        base = "/data/app/~~mFaTHKaeQCtMHRfVMtMotA==/io.github.example-Wrl4URhcc11gECGCG3JvKg==/base.apk"
+        self.assertEqual(trace.short_paths(f"Verify dex file {base}!classes3.dex"), "Verify dex file base.apk!classes3.dex")
+        self.assertEqual(trace.short_paths(f"OpenDexFilesFromOat({base})"), "OpenDexFilesFromOat(base.apk)")
+        self.assertEqual(trace.short_paths("Open dex file /system/framework/framework.jar"), "Open dex file framework.jar")
+        for name in ("relayoutWindow#first=true/resize=true/vis=false", "measure", "Lock contention on a monitor lock (owner tid: 9377)"):
+            self.assertEqual(trace.short_paths(name), name)
+        rows = [{"k": "work", "name": f"Verify dex file {base}!classes{i}.dex", "n": 1, "dur": i, "tot": i, "ts": i}
+                for i in (2, 3)]
+        self.assertEqual([r["name"] for r in trace.merge_work(rows)],
+                         ["Verify dex file base.apk!classes3.dex", "Verify dex file base.apk!classes2.dex"])
+
     def test_aidl_name(self):
         self.assertEqual(trace.aidl_name("AIDL::cpp::IFoo::bar::cppClient"), "IFoo::bar")
         self.assertEqual(trace.aidl_name("AIDL::java::IFoo::bar::server"), "IFoo::bar")
