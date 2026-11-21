@@ -108,10 +108,12 @@ When `dp perf frames` shows slow frames but not why, record a Perfetto trace. It
 dp trace start [--max 60]   # starts recording on the device; --max stops it by itself after that many seconds
 (… the actions that feel slow: tap, scroll, type …)
 dp trace stop               # stops, pulls the file, and prints the summary
+dp trace launch [--wait 5]  # force-stop → record → launch → wait → stop and summarize, in one command: for slow startup
 dp trace report [FILE]      # read a pulled trace again (default: the newest one); needs no device
 ```
 
 - The summary covers the app's process (all `pkg:*` processes added together, and it says so): slow frames by jank type with the longest ones, how long the main thread ran / waited to run / waited on I/O (`カーネル待ち` is other uninterruptible waiting), the heaviest main-thread work (own time), Binder calls from the main thread, and GCs. Each long item names the step it came after (`step 161: tap …`, taken from dp's journal), so the steps (`dp tap` …) between start and stop are what tell you where to look. Only the span between start and stop is analyzed.
+- `dp trace launch` is for a slow startup. It force-stops the app first, so it measures a cold start unless the system keeps the process. The summary leads with the startup: type (cold / warm / hot), startup time, time to first display (TTID), and where the startup time went (class verification, dex loading, Binder, `bind_application` …, in order of time, with a share of the startup); the usual summary follows. `--wait` is how many seconds it keeps recording after the launch, to cover work right after the first frame. The startup section also shows for `start` / `stop` / `report` when the trace holds a startup of the app. If TTID is far later than the startup time, the summary says so: check it in Perfetto UI.
 - The trace file is under `.dp/runs/*-trace/trace.pftrace` and opens at https://ui.perfetto.dev for the full picture.
 - If `--max` ran out before `dp trace stop`, the summary says so: actions after that point are not in the trace. Set `--max` longer than the actions take.
 - Run `dp trace start` / `dp trace stop` one at a time and wait for each to finish (a stop takes a few seconds). A second one while the first is running returns NG `別の dp trace start / stop が実行中です`; read the first one's result instead.

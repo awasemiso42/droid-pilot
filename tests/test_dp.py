@@ -414,6 +414,64 @@ class TraceTest(unittest.TestCase):
         # trace_processor_shell prints quotes inside a CSV field unescaped, which would break parsing.
         self.assertIn("replace(replace(name, '\"', ''''), char(10), ' ')", trace.query_sql("com.example.notes"))
 
+    def startup_rows(self, ttid=1400_000_000, extra=()):
+        base = trace.parse_rows((FIX / "trace-rows.csv").read_text())
+        ms = 1_000_000
+        rows = [{"k": "startup", "name": "cold", "n": 7, "dur": 1000 * ms, "tot": ttid, "ts": base[0]["ts"] + 3 * 10**9}]
+        parts = [("activity_start", 300), ("verify_class", 250), ("open_dex_files_from_oat", 150), ("binder", 100),
+                 ("io", 50), ("Running", 40), ("bind_application", 30), ("choreographer_do_frame", 30),
+                 ("inflate", 20), ("S", 20), ("mystery", 10)]
+        rows += [{"k": "sbreak", "name": r, "n": 7, "dur": d * ms, "tot": 1, "ts": 0} for r, d in parts]
+        rows += [{"k": "sbreak", "name": "binder", "n": 8, "dur": 5 * ms, "tot": 1, "ts": 0}, *extra]
+        return base + rows
+
+    def test_startup_section_comes_first_with_labels_and_percentages(self):
+        rows = self.startup_rows()
+        head, lines, fields = trace.summarize(rows, trace.step_markers(rows, self.STEPS))
+        self.assertEqual(lines[0], "起動 cold 1000ms（+3.0s）  最初の表示（TTID）1400ms（step 160: trace start --max 60）")
+        self.assertEqual(lines[1], "  起動の内訳:")
+        self.assertEqual(lines[2], "    Activity の開始 activity_start 300ms（30%）")
+        self.assertEqual(lines[3], "    クラスの検証 verify_class 250ms（25%）")
+        self.assertEqual(lines[7], "    メインスレッド実行（ほかに当たらない分） Running 40ms（4%）")
+        self.assertEqual(lines[10], "    その他 50ms（5%）")  # 8 shown, the other three folded
+        self.assertTrue(lines[11].startswith("フレーム"))
+        self.assertEqual(fields["startups"], [{"id": 7, "type": "cold", "dur_ms": 1000.0, "ttid_ms": 1400.0, "ts_s": 3.0}])
+        bd = fields["startup_breakdown"]
+        self.assertEqual(bd[0], {"reason": "activity_start", "label": "Activity の開始", "ms": 300.0, "pct": 30.0})
+        self.assertEqual(bd[-1]["reason"], "other")
+        self.assertEqual(len(bd), 9)
+
+    def test_unknown_reason_is_shown_as_is(self):
+        rows = self.startup_rows()
+        for r in rows:
+            if r["name"] == "mystery":
+                r["dur"] = 999_000_000  # biggest now, so it is in the top 8
+        _, lines, _ = trace.summarize(rows, [])
+        self.assertIn("    mystery 999ms（100%）", lines)
+
+    def test_late_ttid_gets_a_note_and_a_missing_one_is_left_out(self):
+        _, lines, _ = trace.summarize(self.startup_rows(ttid=3758_000_000), [])
+        self.assertTrue(lines[1].startswith("  最初の表示が起動の終わりよりだいぶ後です（3758ms と 1000ms）"))
+        _, lines, fields = trace.summarize(self.startup_rows(ttid=0), [])
+        self.assertEqual(lines[0], "起動 cold 1000ms（+3.0s）")
+        self.assertIsNone(fields["startups"][0]["ttid_ms"])
+        self.assertEqual(lines[1], "  起動の内訳:")
+
+    def test_no_startup_rows_means_no_startup_section(self):
+        rows, markers = self.rows()
+        _, lines, fields = trace.summarize(rows, markers)
+        self.assertNotIn("startups", fields)
+        self.assertFalse(any("起動" in l for l in lines))
+        self.assertTrue(lines[0].startswith("フレーム") or "プロセス" in lines[0])
+
+    def test_query_includes_the_startup_modules_and_the_package(self):
+        sql = trace.query_sql("com.example.notes")
+        for mod in ("startups", "time_to_display", "startup_breakdowns"):
+            self.assertIn(f"INCLUDE PERFETTO MODULE android.startup.{mod};", sql)
+        self.assertTrue(sql.lstrip().startswith("INCLUDE PERFETTO MODULE"))
+        self.assertIn("a.package = 'com.example.notes'", sql)
+        self.assertIn("'sbreak'", sql)
+
     def test_remote_path_is_unique_per_app_and_run(self):
         a = trace.remote_path("com.example.a", 1795210555.9)
         self.assertEqual(a, "/data/misc/perfetto-traces/dp-com.example.a-1795210555.pftrace")
@@ -586,17 +644,24 @@ class TraceCliTest(unittest.TestCase):
     """The device side of dp trace, against a fake adb."""
     TRACE = None  # set by the tests that need a real file to pull
 
-    def make(self, tmp, cmdline="perfetto --background", boot="b1", remote_exists=True, alive_at_stop=True):
+    AM_OK = "Status: ok\nLaunchState: COLD\nTotalTime: 1180\nWaitTime: 1190\n"
+
+    def make(self, tmp, cmdline="perfetto --background", boot="b1", remote_exists=True, alive_at_stop=True,
+             am_out=AM_OK, am_err="", am_rc=0):
         import types
         from unittest import mock
         from dp import cli, config
         from dp.state import State
         fake = types.SimpleNamespace(calls=[], alive=alive_at_stop, killed=False)
-        app = config.App(name="notes", package="com.example.notes", repo=Path(tmp))
+        app = config.App(name="notes", package="com.example.notes", repo=Path(tmp), launch=".MainActivity")
 
         class Adb:
             def run(s, *a, input=None, **k):
                 fake.calls.append(a)
+                if a[0] == "shell" and a[1].startswith("am start"):
+                    if am_rc == "timeout":
+                        raise Fail("adb が 60 秒で終わりませんでした: adb shell am start")
+                    return subprocess.CompletedProcess(a, am_rc, am_out, am_err)
                 if a[0] == "shell":
                     fake.input = input
                     return subprocess.CompletedProcess(a, 0, "4242\n", "")
@@ -607,6 +672,8 @@ class TraceCliTest(unittest.TestCase):
                 fake.calls.append(cmd)
                 if cmd.startswith("log -t"):
                     return "1700000100.5\n"
+                if cmd.startswith("am start"):
+                    return am_out
                 if cmd.startswith("kill"):
                     fake.killed, fake.alive = True, False
                     return ""
@@ -625,7 +692,7 @@ class TraceCliTest(unittest.TestCase):
 
     def args(self, what, **kw):
         import types
-        return types.SimpleNamespace(what=what, max=30, file=None, **kw)
+        return types.SimpleNamespace(what=what, max=30, file=None, **{"wait": 5.0, **kw})
 
     def start(self, tmp, **kw):
         cli, ctx, fake = self.make(tmp, **kw)
@@ -725,6 +792,102 @@ class TraceCliTest(unittest.TestCase):
             self.assertEqual(side["steps"], steps)
             self.assertNotIn("trace", ctx.dstate)
             self.assertTrue(fake.killed)
+
+
+    def launch(self, tmp, **kw):
+        from unittest import mock
+        cli, ctx, fake = self.make(tmp, **kw)
+        rows = {"startups": [{"id": 1, "type": "cold", "dur_ms": 1205.0, "ttid_ms": 1576.0, "ts_s": 1.0}]}
+        with mock.patch.object(cli.time, "sleep") as sl, \
+             mock.patch.object(cli.trace, "analyze", return_value=("trace 6.5 秒（step 1）", ["フレーム 3"], rows)) as an:
+            res = cli.c_trace(ctx, self.args("launch"))
+        return cli, ctx, fake, res, sl, an
+
+    def test_launch_runs_force_stop_perfetto_am_start_then_kill_and_pull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake, res, sl, an = self.launch(tmp)
+            self.assertEqual(res.code, 0, res.render())
+            keys = ("force-stop", "perfetto --background", "am start", "kill -TERM", "rm -f")
+            kinds = []
+            for c in fake.calls:
+                if c[0] == "pull":
+                    kinds.append("pull")
+                elif isinstance(c, str) or c[0] == "shell":
+                    text = c if isinstance(c, str) else c[1]
+                    kinds += [k for k in keys if k in text][:1]
+            self.assertEqual(kinds, ["force-stop", "perfetto --background", "am start", "kill -TERM", "pull", "rm -f"])
+            self.assertIn("duration_ms: 82000", fake.input)  # ceil(1.5 + 60 + 5) + 15: a 60 s start still fits
+            self.assertTrue(any(c == cli.PERFETTO_WARMUP for (c,), _ in sl.call_args_list))
+            self.assertEqual(res.head, "trace launch cold 1205ms（最初の表示 1576ms・am start 1180ms）")
+            self.assertEqual(res.lines[0], "trace 6.5 秒（step 1）")
+            self.assertEqual(ctx.dstate["launch_t"], 1700000100.5)
+            self.assertNotIn("trace", ctx.dstate)
+            side = json.loads(next(Path(tmp).glob(".dp/runs/*-trace/trace.json")).read_text())
+            self.assertEqual(side["launch"]["wait"], 5.0)
+            self.assertEqual(side["launch"]["am_start"]["total"], 1180)
+            self.assertEqual([(s["n"], s["cmd"]) for s in side["steps"]], [(1, "trace launch --wait 5")])
+
+    def test_launch_without_a_startup_in_the_trace_still_succeeds_with_a_hint(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.make(tmp)
+            with mock.patch.object(cli.time, "sleep"), \
+                 mock.patch.object(cli.trace, "analyze", return_value=("trace 6.5 秒", ["フレーム 3"], {})):
+                res = cli.c_trace(ctx, self.args("launch"))
+            self.assertEqual(res.code, 0)
+            self.assertEqual(res.head, "trace launch: トレースに起動が見つかりません")
+            self.assertIn("1180ms", res.lines[1])
+
+    def test_launch_failure_cleans_up_and_is_ng(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.make(tmp, am_out="Error: Activity class does not exist.\n")
+            with mock.patch.object(cli.time, "sleep"):
+                res = cli.c_trace(ctx, self.args("launch"))
+            self.assertEqual(res.code, 1)
+            self.assertEqual(res.head, "trace launch: 起動できません")
+            self.assertTrue(fake.killed)
+            self.assertTrue(any(isinstance(c, str) and c.startswith("rm -f /data/misc/perfetto-traces/") for c in fake.calls))
+            self.assertNotIn("trace", ctx.dstate)
+            self.assertFalse(any(isinstance(c, tuple) and c[0] == "pull" for c in fake.calls))
+
+    def test_launch_failure_only_on_stderr_or_exit_code_is_ng(self):
+        from unittest import mock
+        cases = [dict(am_out="", am_err="Error type 3\nError: Activity class {x} does not exist.\n", am_rc=1),
+                 dict(am_out="", am_err="Security exception: Permission Denial\n", am_rc=255),
+                 dict(am_out="", am_err="", am_rc=1),
+                 dict(am_rc="timeout")]
+        for kw in cases:
+            with self.subTest(**{k: str(v) for k, v in kw.items()}), tempfile.TemporaryDirectory() as tmp:
+                cli, ctx, fake = self.make(tmp, **kw)
+                with mock.patch.object(cli.time, "sleep"):
+                    res = cli.c_trace(ctx, self.args("launch"))
+                self.assertEqual(res.code, 1, res.render())
+                self.assertEqual(res.head, "trace launch: 起動できません")
+                self.assertTrue(res.lines)
+                self.assertTrue(fake.killed)
+                self.assertNotIn("trace", ctx.dstate)
+                self.assertFalse(any(isinstance(c, tuple) and c[0] == "pull" for c in fake.calls))
+
+    def test_launch_is_refused_while_a_trace_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake = self.start(tmp)
+            res = cli.c_trace(ctx, self.args("launch"))
+            self.assertEqual(res.code, 1)
+            self.assertIn("trace launch: 記録中です", res.head)
+            self.assertFalse(any(isinstance(c, str) and "force-stop" in c for c in fake.calls))
+            self.assertIn("trace", ctx.dstate)
+
+    def test_report_shows_the_launch_head_from_trace_json(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli, ctx, fake, res, sl, an = self.launch(tmp)
+            pf = next(Path(tmp).glob(".dp/runs/*-trace/trace.pftrace"))
+            import types
+            with mock.patch.object(cli.trace, "analyze", return_value=("trace 6.5 秒", [], {"startups": [
+                    {"id": 1, "type": "warm", "dur_ms": 300.0, "ttid_ms": None, "ts_s": 1.0}]})):
+                r = cli._trace_report(ctx, types.SimpleNamespace(file=str(pf)), ctx.app)
+            self.assertEqual(r.head, "trace launch warm 300ms（am start 1180ms）")
 
 
 class HookTest(unittest.TestCase):

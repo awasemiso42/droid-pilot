@@ -171,7 +171,13 @@ def find_shell(notify=print) -> str:
 # `anchor` carries the offset from trace time to device realtime, which is how dp's journal steps are placed on the trace.
 # One statement, one row shape: k (kind), name, n, dur (ns), tot (ns or a count), ts (ns). The trace is loaded once.
 # `work` ranks main-thread slices by self time (dur minus children) so umbrella slices do not hide the cause.
+# The startup rows come from Perfetto's stdlib (INCLUDE PERFETTO MODULE, separate statements before the query):
+# android_startups, its time to initial display, and the opinionated breakdown that splits a startup's duration
+# into reasons with no gap and no overlap.
 QUERY = """
+INCLUDE PERFETTO MODULE android.startup.startups;
+INCLUDE PERFETTO MODULE android.startup.time_to_display;
+INCLUDE PERFETTO MODULE android.startup.startup_breakdowns;
 WITH win AS (
   SELECT coalesce((SELECT int_value FROM metadata WHERE name = 'tracing_started_ns'), (SELECT start_ts FROM trace_bounds)) AS s,
          coalesce((SELECT int_value FROM metadata WHERE name = 'tracing_disabled_ns'), (SELECT end_ts FROM trace_bounds)) AS e),
@@ -195,7 +201,11 @@ dofr AS (SELECT ts, dur FROM ms WHERE name GLOB 'Choreographer#doFrame*'),
 gcs AS (
   SELECT s.ts, s.dur FROM slice s JOIN thread_track tt ON s.track_id = tt.id JOIN thread t ON t.utid = tt.utid, win
   WHERE t.upid IN (SELECT upid FROM app) AND s.name GLOB '*GC' AND s.dur > 0 AND s.ts >= win.s AND s.ts < win.e),
-binder AS (SELECT ts, dur FROM ms WHERE name GLOB 'binder transaction*')
+binder AS (SELECT ts, dur FROM ms WHERE name GLOB 'binder transaction*'),
+st AS (
+  SELECT a.startup_id, a.ts, a.dur, a.startup_type, coalesce(d.time_to_initial_display, 0) AS ttid
+  FROM android_startups a LEFT JOIN android_startup_time_to_display d ON d.startup_id = a.startup_id, win
+  WHERE a.package = '{pkg}' AND a.ts >= win.s AND a.ts < win.e)
 SELECT k, replace(replace(name, '"', ''''), char(10), ' ') AS name, n, dur, tot, ts FROM (
 SELECT 'span' AS k, '' AS name, 0 AS n, e - s AS dur, 0 AS tot, s AS ts FROM win
 UNION ALL SELECT 'anchor', '', 0, coalesce(to_realtime(s) - s, 0), 0, s FROM win
@@ -219,7 +229,10 @@ UNION ALL SELECT * FROM (
   SELECT 'aidl', name, count(*), max(dur), sum(dur), (SELECT ts FROM ms m2 WHERE m2.name = ms.name ORDER BY m2.dur DESC LIMIT 1)
   FROM ms WHERE name GLOB 'AIDL::*' GROUP BY name HAVING max(dur) >= 1000000 ORDER BY max(dur) DESC LIMIT 3)
 UNION ALL SELECT 'gc', '', count(*), coalesce(max(dur), 0), coalesce(sum(dur), 0),
-  coalesce((SELECT ts FROM gcs ORDER BY dur DESC LIMIT 1), 0) FROM gcs)
+  coalesce((SELECT ts FROM gcs ORDER BY dur DESC LIMIT 1), 0) FROM gcs
+UNION ALL SELECT 'startup', coalesce(startup_type, ''), startup_id, dur, ttid, ts FROM st
+UNION ALL SELECT 'sbreak', coalesce(reason, ''), startup_id, sum(dur), count(*), 0
+  FROM android_startup_opinionated_breakdown WHERE startup_id IN (SELECT startup_id FROM st) GROUP BY startup_id, reason)
 """
 
 
@@ -288,6 +301,18 @@ STATE_GROUPS = (("Running", ("Running",)), ("Runnable", ("R", "R+")), ("I/O", ("
 
 
 OPTIONAL_STATES = ("カーネル待ち",)
+
+
+# Short labels for the opinionated breakdown reasons; unknown reasons are shown as they are.
+BREAK_LABELS = {"activity_start": "Activity の開始", "bind_application": "Application の初期化",
+                "verify_class": "クラスの検証", "open_dex_files_from_oat": "dex の読み込み", "binder": "Binder",
+                "Running": "メインスレッド実行（ほかに当たらない分）", "R": "実行待ち", "R+": "実行待ち",
+                "S": "スリープ", "D": "カーネル待ち", "io": "I/O", "choreographer_do_frame": "最初のフレーム描画",
+                "launch_delay": "プロセス起動までの待ち", "activity_resume": "Activity の resume",
+                "inflate": "レイアウトの inflate", "art_lock_contention": "ロックの競合",
+                "monitor_contention": "ロックの競合", "resources_manager_get_resources": "リソースの読み込み"}
+MAX_BREAK = 8
+TTID_LATE_NS = 500_000_000  # TTID this much later than the startup end is worth a note
 
 
 def _ms(ns):
@@ -386,6 +411,8 @@ def summarize(rows, markers):
         lines.append(f"{len(apps)} 個のプロセス（{', '.join(a['name'] for a in apps[:4])}）をまとめています。"
                      "フレームと GC は全部、メインスレッドは全部のメインスレッドの合計")
 
+    lines += _startup_lines(rows, markers, start, fields)
+
     f = frame_fields(rows)
     fields["frames"] = {k: f[k] for k in ("source", "total", "janky", "types")}
     if f["total"]:
@@ -424,6 +451,49 @@ def summarize(rows, markers):
 
     lines += _binder_gc_lines(rows, markers, start, fields)
     return head, lines, fields
+
+
+def startups(rows) -> list:
+    """`startup` rows, earliest first."""
+    return sorted((r for r in rows if r["k"] == "startup"), key=lambda r: r["ts"])
+
+
+def _startup_lines(rows, markers, start, fields):
+    """The startup section: one line per startup and the breakdown of the first one. Empty when there is none."""
+    sts = startups(rows)
+    if not sts:
+        return []
+    lines = []
+    fields["startups"] = [{"id": r["n"], "type": r["name"], "dur_ms": round(_ms(r["dur"]), 1),
+                           "ttid_ms": round(_ms(r["tot"]), 1) if r["tot"] else None,
+                           "ts_s": round((r["ts"] - start) / 1e9, 2)} for r in sts]
+    for r in sts:
+        t = (r["ts"] - start) / 1e9
+        ttid = f"  最初の表示（TTID）{_ms_text(r['tot'])}" if r["tot"] else ""
+        lines.append(f"起動 {r['name'] or '?'} {_ms_text(r['dur'])}（+{t:.1f}s）{ttid}{_step(markers, t)}")
+        if r["tot"] - r["dur"] > TTID_LATE_NS:  # right under the startup it is about
+            lines.append(f"  最初の表示が起動の終わりよりだいぶ後です（{_ms_text(r['tot'])} と {_ms_text(r['dur'])}）。"
+                         "起動のあとの最初のフレームが遅れたか、Perfetto の判定がずれています。Perfetto UI で確認してください")
+    first = sts[0]
+    by = sorted((r for r in rows if r["k"] == "sbreak" and r["n"] == first["n"]), key=lambda r: -r["dur"])
+    fields["startup_breakdown"] = []
+    if by and first["dur"]:
+        which = f"（1 回目の {first['name'] or '?'}）" if len(sts) > 1 else ""
+        lines.append(f"  起動の内訳{which}:")
+        shown = by[:MAX_BREAK]
+        for r in shown:
+            label = BREAK_LABELS.get(r["name"])
+            pct = 100 * r["dur"] / first["dur"]
+            text = f"{label} {r['name']}" if label and label != r["name"] else r["name"]
+            lines.append(f"    {text} {_ms_text(r['dur'])}（{pct:.0f}%）")
+            fields["startup_breakdown"].append({"reason": r["name"], "label": label or r["name"],
+                                                "ms": round(_ms(r["dur"]), 1), "pct": round(pct, 1)})
+        rest = sum(r["dur"] for r in by[MAX_BREAK:])
+        if rest:
+            lines.append(f"    その他 {_ms_text(rest)}（{100 * rest / first['dur']:.0f}%）")
+            fields["startup_breakdown"].append({"reason": "other", "label": "その他", "ms": round(_ms(rest), 1),
+                                                "pct": round(100 * rest / first["dur"], 1)})
+    return lines
 
 
 def _binder_gc_lines(rows, markers, start, fields):

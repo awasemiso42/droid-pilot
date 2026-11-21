@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -1053,6 +1054,9 @@ def c_perf(ctx, a):
 # --- trace (Perfetto) ----------------------------------------------------------------------------------
 
 TRACE_WAIT = 15
+PERFETTO_WARMUP = 1.5  # seconds between starting perfetto and the app launch, so the data sources are on
+LAUNCH_TIMEOUT = 60  # seconds `am start -W` may take in trace launch
+TRACE_LAUNCH_SLACK = 15  # trace launch stops perfetto itself; the safety stop (if dp dies) covers the whole run plus this
 BOOT_ID = "/proc/sys/kernel/random/boot_id"
 
 
@@ -1080,29 +1084,48 @@ def _trace_analyze(package, path, steps=(), auto_stop=None):
     return head, notes + lines + [f"trace: {rel(path)}", f"{trace.UI_URL} で開けます"], fields
 
 
-def _trace_start(ctx, a, app):
+def _trace_refusal(ctx, label):
+    """An NG result when a trace cannot be started now (one is already recorded, or the device is too old); else None."""
     dev = ctx.dev
     cur = ctx.dstate.get("trace")
     if cur:
         state = "記録中です" if _perfetto_alive(dev, cur) else "終わった記録が端末に残っているかもしれません"
-        return ng(f"trace start: {state}（{cur['step']}）", ["dp trace stop で取り出してください"])
+        return ng(f"{label}: {state}（{cur['step']}）", ["dp trace stop で取り出してください"])
     if dev.api < trace.MIN_API:
-        return ng(f"trace start: API {trace.MIN_API} 以上の端末が必要です（この端末は API {dev.api}）")
-    secs = max(1, a.max)
+        return ng(f"{label}: API {trace.MIN_API} 以上の端末が必要です（この端末は API {dev.api}）")
+    return None
+
+
+def _perfetto_begin(ctx, app, secs, n, dev_t, step_name="trace start"):
+    """Starts perfetto in the background and records it in the trace state. Returns the error lines, or None when it runs."""
+    dev = ctx.dev
     cfg = trace.perfetto_config(app.package, secs)
-    n, dev_t = ctx.step("trace start")
     remote = trace.remote_path(app.package, dev_t or time.time())
     p = dev.adb.run("shell", f"perfetto --background --txt -c - -o {remote}", input=cfg, timeout=30)
     m = re.search(r"^\s*(\d+)\s*$", p.stdout, re.M)
     if p.returncode != 0 or not m:
-        err = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip()][:3]
+        return [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip()][:3] or ["perfetto が pid を返しませんでした"]
+    ctx.dstate["trace"] = {"pid": int(m.group(1)), "remote": remote, "start_t": dev_t or dev.epoch(), "n": n,
+                           "step": f"step {n}: {step_name}", "max": secs,
+                           "boot_id": dev.adb.sh(f"cat {BOOT_ID}", timeout=10).strip()}
+    return None
+
+
+def _trace_start(ctx, a, app):
+    dev = ctx.dev
+    refused = _trace_refusal(ctx, "trace start")
+    if refused:
+        return refused
+    secs = max(1, a.max)
+    trace.perfetto_config(app.package, secs)  # a bad package name fails before the step is counted
+    n, dev_t = ctx.step("trace start")
+    err = _perfetto_begin(ctx, app, secs, n, dev_t)
+    if err is not None:
         res = ng("trace start: perfetto を始められません", err)
     else:
-        ctx.dstate["trace"] = {"pid": int(m.group(1)), "remote": remote, "start_t": dev_t or dev.epoch(), "n": n,
-                               "step": f"step {n}: trace start", "max": secs,
-                               "boot_id": dev.adb.sh(f"cat {BOOT_ID}", timeout=10).strip()}
+        pid = ctx.dstate["trace"]["pid"]
         res = ok(f"trace start（step {n}。最大 {secs} 秒）",
-                 ["操作したあと dp trace stop で取り出して調べます"], pid=int(m.group(1)), max_secs=secs)
+                 ["操作したあと dp trace stop で取り出して調べます"], pid=pid, max_secs=secs)
     ctx.journal(n, f"trace start --max {secs}", res, dev_t)
     return res
 
@@ -1115,13 +1138,12 @@ def _trace_steps(ctx, cur, stop_n, stop_t):
     return steps + [{"n": stop_n, "cmd": "trace stop", "dev_t": stop_t}]
 
 
-def _trace_stop(ctx, app):
+def _trace_collect(ctx, app, cur, n, dev_t, label, journal_cmd, steps, redo, launch=None):
+    """Stops our perfetto, pulls the file, analyzes it. Shared by `trace stop` and `trace launch`.
+
+    `label` prefixes the messages, `journal_cmd` is what the journal gets, `redo` is the command to start over with.
+    """
     dev = ctx.dev
-    cur = ctx.dstate.get("trace")
-    if not cur:
-        return ng("trace stop: 記録していません", ["dp trace start から始めてください",
-                                                 "直前に別の dp trace stop が取り出していれば dp trace report で見られます"])
-    n, dev_t = ctx.step("trace stop")
     pid = int(cur["pid"])
     ended_early = not _perfetto_alive(dev, cur)  # --max may have stopped it already
     if not ended_early:
@@ -1131,35 +1153,109 @@ def _trace_stop(ctx, app):
                 break
             time.sleep(0.5)
         else:
-            res = ng(f"trace stop: perfetto が {TRACE_WAIT} 秒たっても終わりません",
+            res = ng(f"{label}: perfetto が {TRACE_WAIT} 秒たっても終わりません",
                      [f"もう一度 dp trace stop を実行してください（pid {pid}）"])
-            ctx.journal(n, "trace stop", res, dev_t)
+            ctx.journal(n, journal_cmd, res, dev_t)
             return res
     if "yes" not in dev.adb.sh(f"[ -f {cur['remote']} ] && echo yes || echo no", timeout=10):
         ctx.dstate.pop("trace", None)
-        res = ng("trace stop: 記録のファイルが端末にありません（再起動などで消えました）", ["dp trace start からやり直してください"])
-        ctx.journal(n, "trace stop", res, dev_t)
+        res = ng(f"{label}: 記録のファイルが端末にありません（再起動などで消えました）", [f"{redo} からやり直してください"])
+        ctx.journal(n, journal_cmd, res, dev_t)
         return res
     path = ctx.state.run_dir("trace") / "trace.pftrace"
     p = dev.adb.run("pull", cur["remote"], str(path), timeout=180)
     if p.returncode != 0 or not path.exists():
         err = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip()][:3]
-        res = ng("trace stop: トレースを取り出せません（もう一度 dp trace stop できます）", err)
-        ctx.journal(n, "trace stop", res, dev_t)
+        res = ng(f"{label}: トレースを取り出せません（もう一度 dp trace stop できます）", err)
+        ctx.journal(n, journal_cmd, res, dev_t)
         return res
     dev.adb.sh(f"rm -f {cur['remote']}", timeout=15)
     ctx.dstate.pop("trace", None)
-    steps = _trace_steps(ctx, cur, n, dev_t)
     auto_stop = cur.get("max", "?") if ended_early else None
-    path.with_name("trace.json").write_text(json.dumps({"package": app.package, "steps": steps, "auto_stop": auto_stop},
-                                                       ensure_ascii=False))
+    meta = {"package": app.package, "steps": steps, "auto_stop": auto_stop}
+    if launch:
+        meta["launch"] = launch
+    path.with_name("trace.json").write_text(json.dumps(meta, ensure_ascii=False))
     try:
         head, lines, fields = _trace_analyze(app.package, path, steps, auto_stop)
+        if launch:
+            head, lines = _launch_head(head, lines, fields, launch)
         res = ok(head, lines, **fields)
     except Fail as e:
-        res = ng(f"trace stop: {e.msg}", [*e.lines, f"取り出し済み: {rel(path)}（dp trace report で読み直せます）"])
-    ctx.journal(n, "trace stop", res, dev_t)
+        res = ng(f"{label}: {e.msg}", [*e.lines, f"取り出し済み: {rel(path)}（dp trace report で読み直せます）"])
+    ctx.journal(n, journal_cmd, res, dev_t)
     return res
+
+
+def _trace_stop(ctx, app):
+    cur = ctx.dstate.get("trace")
+    if not cur:
+        return ng("trace stop: 記録していません", ["dp trace start から始めてください",
+                                                 "直前に別の dp trace stop が取り出していれば dp trace report で見られます"])
+    n, dev_t = ctx.step("trace stop")
+    return _trace_collect(ctx, app, cur, n, dev_t, "trace stop", "trace stop", _trace_steps(ctx, cur, n, dev_t),
+                          "dp trace start")
+
+
+def _launch_head(head, lines, fields, launch):
+    """(head, lines) of `trace launch`: the startup first; the plain trace head moves to the first line."""
+    am = (launch.get("am_start") or {}).get("total")
+    sts = fields.get("startups")
+    if not sts:
+        extra = [f"am start の TotalTime は {am}ms でした" if am is not None else "am start の TotalTime は読めませんでした",
+                 "アプリがもう動いていたか、起動がトレースの始まる前だったかもしれません（dp stop してからもう一度）"]
+        return "trace launch: トレースに起動が見つかりません", [head, *extra, *lines]
+    s = sts[0]
+    parts = []
+    if s["ttid_ms"]:
+        parts.append(f"最初の表示 {s['ttid_ms']:.0f}ms")
+    if am is not None:
+        parts.append(f"am start {am}ms")
+    tail = f"（{'・'.join(parts)}）" if parts else ""
+    return f"trace launch {s['type'] or '?'} {s['dur_ms']:.0f}ms{tail}", [head, *lines]
+
+
+def _trace_launch(ctx, a, app):
+    """Stop the app, record, start it, wait, then stop and analyze: one command for a startup trace."""
+    dev = ctx.dev
+    refused = _trace_refusal(ctx, "trace launch")
+    if refused:
+        return refused
+    wait = max(0.0, a.wait)
+    secs = math.ceil(PERFETTO_WARMUP + LAUNCH_TIMEOUT + wait) + TRACE_LAUNCH_SLACK  # a slow start is never cut off
+    comp = _launch_activity(dev, app)
+    cmd = f"trace launch --wait {wait:g}"
+    n, dev_t = ctx.step(cmd)
+    dev.adb.sh(f"am force-stop {app.package}", timeout=15)
+    time.sleep(1.0)
+    err = _perfetto_begin(ctx, app, secs, n, dev_t, "trace launch")
+    if err is not None:
+        res = ng("trace launch: perfetto を始められません", err)
+        ctx.journal(n, cmd, res, dev_t)
+        return res
+    cur = ctx.dstate["trace"]
+    time.sleep(PERFETTO_WARMUP)  # perfetto --background returns before the data sources are running
+    ctx.dstate["launch_t"] = dev_t
+    try:
+        # run(), not sh(): am start reports some failures only on stderr and with a nonzero exit code
+        p = dev.adb.run("shell", f"am start -W -n {shlex.quote(comp)}", timeout=LAUNCH_TIMEOUT)
+        out, bad = p.stdout, [l.strip() for l in (p.stdout + p.stderr).splitlines()
+                              if "Error" in l or "Exception" in l][:3]
+        if p.returncode != 0 and not bad:
+            bad = [l.strip() for l in (p.stderr + p.stdout).splitlines() if l.strip()][:3] or [f"am start が {p.returncode} で終わりました"]
+    except Fail as e:  # adb timed out
+        out, bad = "", [e.msg, *e.lines]
+    if bad:
+        dev.adb.sh(f"kill -TERM {int(cur['pid'])} 2>/dev/null", timeout=10)
+        dev.adb.sh(f"rm -f {cur['remote']}", timeout=15)
+        ctx.dstate.pop("trace", None)
+        res = ng("trace launch: 起動できません", bad)
+        ctx.journal(n, cmd, res, dev_t)
+        return res
+    launch = {"am_start": perf.parse_start(out), "wait": wait}
+    time.sleep(wait)
+    steps = [{"n": n, "cmd": cmd, "dev_t": dev_t}]
+    return _trace_collect(ctx, app, cur, n, dev_t, "trace launch", cmd, steps, "dp trace launch", launch)
 
 
 @contextlib.contextmanager
@@ -1199,6 +1295,8 @@ def _trace_report(ctx, a, app):
     except (OSError, json.JSONDecodeError):
         meta = {}
     head, lines, fields = _trace_analyze(app.package, path, meta.get("steps", []), meta.get("auto_stop"))
+    if meta.get("launch"):
+        head, lines = _launch_head(head, lines, fields, meta["launch"])
     return ok(head, lines, **fields)
 
 
@@ -1210,6 +1308,8 @@ def c_trace(ctx, a):
     with _trace_lock(ctx):
         if a.what == "start":
             return _trace_start(ctx, a, app)
+        if a.what == "launch":
+            return _trace_launch(ctx, a, app)
         return _trace_stop(ctx, app)
 
 
@@ -1420,9 +1520,10 @@ def build_parser():
     s.add_argument("--secs", type=float, default=10, help="idle: 触らずに待つ秒数")
     s.add_argument("--depth", type=int, default=2, help="apk: まとめるフォルダの深さ")
     s.add_argument("--top", type=int, default=8, help="apk: 表示する件数")
-    s = cmd("trace", c_trace, "Perfetto のトレース（start → 操作 → stop で、遅い原因を調べる）")
-    s.add_argument("what", choices=["start", "stop", "report"])
+    s = cmd("trace", c_trace, "Perfetto のトレース（start → 操作 → stop、または launch で起動を、遅い原因を調べる）")
+    s.add_argument("what", choices=["start", "stop", "launch", "report"])
     s.add_argument("--max", type=int, default=60, help="start: 止め忘れても自動で止まる秒数")
+    s.add_argument("--wait", type=float, default=5, help="launch: 起動してから止めるまでの秒数")
     s.add_argument("file", nargs="?", help="report: 調べるトレース（省略すると最新）")
     s = cmd("env", c_env, "端末の見た目（ダーク・文字の大きさ・向き）。safe 以外")
     s.add_argument("what", choices=["show", "dark", "font", "rotate", "reset"])
