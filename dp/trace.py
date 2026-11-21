@@ -312,13 +312,20 @@ def _step_numbers(markers):
     return f"step {lo}" if lo == hi else f"step {lo}–{hi}"
 
 
+def short_paths(name: str) -> str:
+    """Absolute paths in a slice name cut to their last part, so the 60-character column still tells them apart:
+    Verify dex file /data/app/~~x==/pkg-y==/base.apk!classes3.dex -> Verify dex file base.apk!classes3.dex"""
+    return re.sub(r"(?<![\w=/.])/(?:[^\s/()]+/)+([^\s/()]+)", r"\1", name)
+
+
 def merge_work(rows) -> list:
-    """`work` rows with per-instance ids dropped from the names (ViewPostImeInputStage id=0x1f), merged, worst first."""
+    """`work` rows with per-instance ids dropped from the names (ViewPostImeInputStage id=0x1f) and paths cut short,
+    merged, worst first."""
     merged = {}
     for r in rows:
         if r["k"] != "work":
             continue
-        name = re.sub(r"\s+id=0x[0-9a-f]+", "", r["name"])
+        name = short_paths(re.sub(r"\s+id=0x[0-9a-f]+", "", r["name"]))
         m = merged.get(name)
         if not m:
             merged[name] = {**r, "name": name}
